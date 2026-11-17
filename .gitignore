@@ -1,0 +1,33 @@
+data/
+logs/
+history/
+images/
+state.json
+__pycache__/
+*.session*
+# 配置里有真实群 ID 与群名，不要提交
+config.yaml
+config.yaml.real-backup
+telegram-checkin.jpg
+nul
+*.log
+capture-*.json
+audit/
+.audit-venv/
+.audit-browsers/
+.venv/
+config.yaml.bak
+state.json.bak
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+
+# Local maintainer instructions and publication drafts
+/AGENTS.md
+/docs/RELEASING.md
+/docs/DEVELOPMENT.md
+/docs/releases/

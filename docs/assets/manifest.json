@@ -1,0 +1,14 @@
+{
+  "automation.png": {
+    "sha256": "a65eaaf0fdce62faa58ef2ff2f0c7c64bd666f6b2565b34dc41ae10df057be3c",
+    "source": "anonymous API fixtures; visually reviewed"
+  },
+  "topic-picker.png": {
+    "sha256": "c67f23e93b26a72a527d7bf736322875681ba98bedf9519dfe4864eb512d8803",
+    "source": "anonymous API fixtures; visually reviewed"
+  },
+  "workbench.png": {
+    "sha256": "41e5babead9b0386dfc267e971d54ee3376dab66479a1d799c3ac8ec30ec397a",
+    "source": "anonymous API fixtures; visually reviewed"
+  }
+}

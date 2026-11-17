@@ -1,0 +1,75 @@
+name: Build and verify standalone packages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_draft_id:
+        description: 'Optional existing draft release ID for verified package staging'
+        required: false
+        default: ''
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    permissions:
+      contents: write
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: windows-2022, target: windows-x64, arch: x64, binary: telegram-checkin.exe}
+          - {runner: ubuntu-22.04, target: linux-x64, arch: x64, binary: telegram-checkin}
+          - {runner: ubuntu-22.04-arm, target: linux-arm64, arch: arm64, binary: telegram-checkin}
+          - {runner: macos-15-intel, target: macos-x64, arch: x64, binary: telegram-checkin}
+          - {runner: macos-15, target: macos-arm64, arch: arm64, binary: telegram-checkin}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/build/browsers
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.arch }}
+      - run: python -m pip install -r requirements.lock.txt -r requirements-build.txt
+      - name: Install browser and system libraries
+        run: python -m playwright install --with-deps chromium
+      - name: Unit and browser DOM regression
+        run: python -m unittest discover -s tests -q
+      - run: python app.py --selftest
+      - name: Anonymous GUI regression
+        run: python tools/verify_gui.py
+      - name: Privacy allowlist check
+        run: python tools/privacy_check.py
+      - name: Build standalone directory
+        run: python tools/build_portable.py
+      - name: Compiled program verification
+        run: python tools/smoke_portable.py build/native/dist/telegram-checkin/${{ matrix.binary }}
+      - name: Linux service startup and crash recovery
+        if: runner.os == 'Linux'
+        run: python tools/verify_deployment.py build/native/dist/telegram-checkin/telegram-checkin
+      - uses: actions/upload-artifact@v4
+        if: inputs.release_draft_id == ''
+        with:
+          name: portable-${{ matrix.target }}
+          path: dist/telegram-checkin-v*-${{ matrix.target }}.*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Stage verified packages in an existing release draft
+        if: inputs.release_draft_id != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_DRAFT_ID: ${{ inputs.release_draft_id }}
+        run: python tools/stage_release.py --target ${{ matrix.target }}

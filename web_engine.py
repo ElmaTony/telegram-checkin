@@ -1,0 +1,1499 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Telegram 网页版（web.telegram.org/k/）签到引擎。
+
+不需要 api_id/api_hash：Playwright 驱动真实 Chromium，扫码登录一次，
+会话保存在 data/web_profiles/<账号名>/，之后全自动签到。
+
+用法：
+    python web_engine.py login 账号名    # 打开浏览器扫码登录（账号名同 config.yaml）
+    python web_engine.py test 账号名     # 打开浏览器手动检查会话是否有效
+"""
+
+import asyncio
+import json
+import logging
+import socket
+import sys
+import time
+import urllib.request
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from playwright.async_api import async_playwright
+from core.config import safe_name
+from core.locks import FileLock
+from core.storage import atomic_write
+from core.paths import BASE_DIR, configure_browser_path, visible_browser_available
+
+log = logging.getLogger("checkin.web")
+
+PROFILES_DIR = BASE_DIR / "data" / "web_profiles"
+configure_browser_path()
+BASE_URL = "https://web.telegram.org/k/"
+
+# K 版前端的 class 名会随版本变化，每类元素给多个候选，按序尝试
+# （2026-09-27 用已登录会话实测过：sidebar/chatlist-chat/peer-title/bubble/btn-send 均正确）
+SEL_COMPOSER = [
+    "div[contenteditable='true'].input-message-input",   # 真输入框（页面还有一个 fake 元素要避开）
+    "div[contenteditable='true'][data-peer-id]",
+]
+SEL_SEND = [".btn-send", "button.send"]
+SEL_FILE_INPUT = ["input[type='file']", ".input-file"]
+SEL_BTN_ROW = [".reply-markup-button", ".btn-reply-markup", ".reply-markup .btn-item"]
+SEL_CHAT_LIST = [".sidebar", ".chatlist-container", ".dialog-list"]
+SEL_AUTH = [".auth", ".login-page", "#auth"]
+SEL_SEARCH = ["input.input-search-input", ".sidebar-search-input",
+              "input[placeholder*='搜索']", "input[placeholder*='Search']"]
+
+COMMON_PROXY_PORTS = [
+    ("http", 7890),    # Clash 混合端口
+    ("http", 7897),    # Clash Verge 默认
+    ("http", 10809),   # v2rayN HTTP
+    ("socks5", 10808),  # v2rayN SOCKS
+    ("socks5", 1080),   # 通用 SOCKS
+]
+
+
+def resolve_proxy(cfg):
+    """网页引擎的代理：配置项 web_proxy 优先，其次系统代理，再探测常见本地端口。"""
+    explicit = str(cfg.get("web_proxy") or "").strip()
+    if explicit:
+        if "//" not in explicit:
+            explicit = "http://" + explicit
+        return {"server": explicit}
+    sys_proxy = urllib.request.getproxies().get("https") or urllib.request.getproxies().get("http")
+    if sys_proxy:
+        if sys_proxy.startswith("//"):
+            sys_proxy = "http:" + sys_proxy
+        if "//" not in sys_proxy:
+            sys_proxy = "http://" + sys_proxy
+        return {"server": sys_proxy}
+    for scheme, port in COMMON_PROXY_PORTS:
+        host = "127.0.0.1"
+        if cfg.get("web_proxy_host"):
+            host = str(cfg.get("web_proxy_host"))
+        try:
+            with socket.create_connection((host, port), timeout=0.4):
+                return {"server": f"{scheme}://{host}:{port}"}
+        except OSError:
+            continue
+    return None
+
+
+class TopicSelectionError(RuntimeError):
+    """An ambiguous destination must stop navigation instead of trying other routes."""
+
+
+class WebEngine:
+    def __init__(self, acc, cfg):
+        self.name = acc["name"]
+        self.cfg = cfg
+        self.profile = PROFILES_DIR / safe_name(self.name)
+        self.headless = bool(cfg.get("web_headless", False)) or not visible_browser_available()
+        self.send_started_at = None
+        self.send_started_monotonic = None
+        self.before_send = None
+        self._media_preview = None
+        self._media_upload_started = False
+        self._media_dispatch_attempted = False
+        self.pw = None
+        self.browser = None
+        self.page = None
+        # 本会话内「我发出去的消息」的 data-mid 登记表：bot 气泡上的
+        # data-reply-to-mid 与其中之一相等 = 这条回复明确是回给我的，
+        # 群里别人发同样签到词得到的结果不再混进判定池
+        self.last_sent_mids = set()
+        self._mids_chat = None
+        self._expected_peer = None
+        self._expected_topic = None
+        self._expected_topic_id = None
+        self._configured_topic_id = None
+        self._topic_ids = {}
+        self.last_topic_selection = None
+        self.last_draft_warning = None
+        self._automation_text = None
+        self._capture_by_chat = {}
+        self._sent_by_chat = {}
+        self._resolved_peers = {}
+        self.last_replied = []
+        self.last_evidence = []
+        self._active_mids = None
+        self._profile_lock = None
+        self._login_verified = False
+
+    # ---------- 基础 ----------
+
+    async def launch(self):
+        self._profile_lock = FileLock(PROFILES_DIR.parent / "locks" / (safe_name(self.name) + ".lock"))
+        self._profile_lock.acquire()
+        try:
+            self.profile.mkdir(parents=True, exist_ok=True)
+            try:
+                cache = json.loads((self.profile / 'checkin-topics.json').read_text(encoding='utf-8'))
+                if isinstance(cache, dict) and all(isinstance(k, str) and isinstance(v, dict)
+                    and all(isinstance(t, str) and isinstance(i, str) and i.isdigit() and int(i)>0 for t, i in v.items()) for k, v in cache.items()):
+                    self._topic_ids = cache
+            except (OSError, ValueError):
+                pass  # A disposable navigation hint; never an authority for sending.
+            self.pw = await async_playwright().start()
+            options = {"headless": self.headless, "proxy": resolve_proxy(self.cfg),
+                       "viewport": {"width": 1280, "height": 800},
+                       "args": ["--disable-blink-features=AutomationControlled"]}
+            if self.cfg.get("web_browser_channel"):
+                options["channel"] = self.cfg["web_browser_channel"]
+            self.browser = await self.pw.chromium.launch_persistent_context(str(self.profile), **options)
+            self.page = self.browser.pages[0] if self.browser.pages else await self.browser.new_page()
+            log.info('[%s] 浏览器已启动：%s', self.name, '后台运行' if self.headless else '显示签到过程')
+            if not self.headless:
+                await self.page.bring_to_front()
+            return self
+        except BaseException:
+            await self.close()
+            raise
+
+    async def close(self):
+        try:
+            if self.browser:
+                try:
+                    await self.browser.close()
+                finally:
+                    self.browser = None
+        finally:
+            try:
+                if self.pw:
+                    await self.pw.stop()
+            finally:
+                self.pw = None
+                self.page = None
+                if self._profile_lock:
+                    self._profile_lock.release()
+                    self._profile_lock = None
+
+    def marker(self):
+        return self.profile.parent / (self.profile.name + ".loggedin")
+
+    async def _first(self, selectors, timeout=15000):
+        """All candidates share one deadline; cached hidden nodes never mask visible ones."""
+        deadline = time.monotonic() + timeout / 1000
+        while time.monotonic() < deadline:
+            for selector in selectors:
+                matches = self.page.locator(selector)
+                for index in range(min(await matches.count(), 20)):
+                    match = matches.nth(index)
+                    if await match.is_visible():
+                        return match
+            await asyncio.sleep(min(.1, max(0, deadline-time.monotonic())))
+        raise RuntimeError(f"页面元素没找到（{selectors[0]} 等）")
+
+    # ---------- 登录 ----------
+
+    async def _looks_logged_in_now(self):
+        """登录判定：localStorage 里有 user_auth 或左侧会话栏可见。"""
+        for selector in SEL_AUTH:
+            if await self._visible([selector]):
+                return False
+        for sel in SEL_CHAT_LIST:
+            try:
+                if await self.page.locator(sel).first.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def is_logged_in(self):
+        for attempt in range(3):
+            try:
+                await self.page.goto(BASE_URL, wait_until="domcontentloaded", timeout=15000)
+                break
+            except Exception as error:
+                transient = any(code in str(error) for code in (
+                    'ERR_CONNECTION_CLOSED', 'ERR_CONNECTION_RESET', 'ERR_TIMED_OUT',
+                    'ERR_NETWORK_CHANGED', 'Timeout'))
+                if not transient or attempt == 2:
+                    raise RuntimeError(f"打不开 web.telegram.org：{error}\n"
+                                       "请检查网络及已配置的代理；浏览器尚未进入会话，本次未发送。") from error
+                log.warning('[%s] Telegram 连接暂时中断，重试打开网页（%d/2）', self.name, attempt + 1)
+                await asyncio.sleep(.5 * (attempt + 1))
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if await self._looks_logged_in_now():
+                return True
+            await asyncio.sleep(.25)
+        self.marker().unlink(missing_ok=True)
+        return False
+
+    async def login_interactive(self):
+        """打开可见浏览器等用户扫码，登录成功自动检测并保存标记（无需按回车）。"""
+        if not visible_browser_available():
+            raise RuntimeError('当前服务器没有可视桌面，请通过桌面或 X11 转发完成首次扫码登录')
+        self.headless = False
+        await self.launch()
+        try:
+            if await self.is_logged_in():
+                print("✅ 该账号已是登录状态，无需扫码")
+                self.marker().write_text("ok", encoding="utf-8")
+                return True
+            print("请在打开的浏览器窗口中扫码登录（Settings → Devices → Link Desktop Device）")
+            print("登录成功后这里会自动检测到，无需任何按键（最长等 5 分钟）……")
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                await asyncio.sleep(4)
+                try:
+                    if await self._looks_logged_in_now():
+                        self.marker().write_text("ok", encoding="utf-8")
+                        print("✅ 登录成功，会话已保存，浏览器窗口将自动关闭")
+                        return True
+                except Exception:
+                    pass  # 页面跳转瞬间可能读不到，下一轮再查
+            print("⚠ 等待超时。如果你其实已经扫码成功，重新运行本命令即可自动确认")
+            return False
+        finally:
+            await self.close()
+
+    async def ensure_login(self):
+        if self._login_verified and await self._looks_logged_in_now():
+            return True
+        if not await self.is_logged_in():
+            self.marker().unlink(missing_ok=True)
+            raise RuntimeError("网页版未登录（运行 python web_engine.py login 账号名 扫码）")
+        self._login_verified = True
+        return True
+
+    # ---------- 签到动作 ----------
+
+    def chat_url(self, chat_ref):
+        # K 版 peer id 原样用作 URL hash（实测 href 形如 #-3830659441 / #@user）
+        ref = str(chat_ref).strip().lstrip("#")
+        return BASE_URL + "#" + ref
+
+    _CHAT_VIEW_JS = r"""(options = {}) => {
+            options ||= {};
+            const visible = el => el && el.checkVisibility() && !el.closest('.bubbles, .chatlist-container, ul.chatlist');
+            const titles = [...document.querySelectorAll('.chat-info .peer-title, .topbar .peer-title')].filter(visible);
+            const title = titles.find(el => el.hasAttribute('data-thread-id')) || titles.find(el => el.getAttribute('data-peer-id')) || titles[0];
+            const inputs = [...document.querySelectorAll('[contenteditable="true"][data-peer-id]')].filter(visible);
+            const composer = inputs[0];
+            const pid = title?.getAttribute('data-peer-id') || composer?.getAttribute('data-peer-id');
+            const inputPid = composer && composer.getAttribute('data-peer-id');
+            const thread = title?.getAttribute('data-thread-id');
+            const inputThread = composer?.getAttribute('data-thread-id');
+            const info = !title ? {} : {pid: inputPid && inputPid !== pid ? null : pid,
+                title: title.textContent.trim(), username: title.getAttribute('data-username') || '',
+                composer_peer: inputPid, topic_id: thread && thread!=='0' ? thread : null, composer_topic_id: inputThread || null};
+            if (thread && inputThread && thread !== inputThread) info.pid = null;
+            if (!options.peer) return info;
+            const rows = [];
+            for (const pane of document.querySelectorAll('.topics-slider .topics-container')) {
+                if (!pane.checkVisibility()) continue;
+                const header = pane.querySelector('.sidebar-header__title .peer-title[data-peer-id], .sidebar-header .peer-title[data-peer-id]');
+                if (header?.getAttribute('data-peer-id') !== options.peer) continue;
+                for (const row of pane.querySelectorAll('a[data-peer-id][data-thread-id]')) {
+                    if (!row.checkVisibility() || row.getAttribute('data-peer-id') !== options.peer) continue;
+                    if (row.getAttribute('data-thread-id') === '0') continue;
+                    const name = row.querySelector('.row-title .peer-title')?.textContent.trim();
+                    if (name === options.title) rows.push(row);
+                }
+            }
+            const matches = [...new Set(rows.map(row => row.getAttribute('data-thread-id')))];
+            return {info, matches};
+    }"""
+
+    async def opened_chat_info(self):
+        """Visible peer, composer and topic ID; cached headers never establish identity."""
+        return await self.page.evaluate(self._CHAT_VIEW_JS)
+
+    async def _opened_peer(self):
+        return (await self.opened_chat_info()).get("pid")
+
+    async def _wait_opened(self, ref, timeout=6):
+        ref = str(ref).strip().lstrip("#")
+        expected = ref if ref.lstrip("-").isdigit() else self._resolved_peers.get(ref.lower())
+        if not expected:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if str(await self._opened_peer()) == str(expected):
+                return True
+            await asyncio.sleep(min(.15, max(0, deadline - time.monotonic())))
+        return False
+
+    async def assert_destination(self):
+        info = await self.opened_chat_info()
+        actual = info.get('pid')
+        self._last_actual_peer = actual
+        if not self._expected_peer or str(actual) != str(self._expected_peer):
+            raise RuntimeError(f"目标会话核对失败：配置 {self._expected_peer or self._mids_chat}，当前 {actual or '无'}；未发送")
+        if self._expected_topic:
+            actual_topic = info.get('title', '')
+            if actual_topic.strip() != self._expected_topic.strip():
+                raise RuntimeError(f"话题核对失败：配置「{self._expected_topic}」，当前「{actual_topic}」；未发送")
+            if not self._expected_topic_id or info.get('topic_id') != self._expected_topic_id or info.get('composer_peer') != str(self._expected_peer):
+                raise RuntimeError(f"话题 ID 核对失败：配置 {self._expected_topic_id or '未解析'}，当前 {info.get('topic_id') or '无'}；未发送")
+        return actual
+
+    _SCROLL_FIND_JS = r"""(ref) => {
+        const refN = ref.toLowerCase();
+        const uls = [...document.querySelectorAll('ul.chatlist')];
+        let target = null, bestH = 0;
+        for (const ul of uls) {
+            const tab = ul.closest('.tabs-tab');
+            const active = !tab || tab.className.includes('active');
+            const r = ul.getBoundingClientRect();
+            if (ul.checkVisibility() && !ul.closest('.topics-slider') && r.height > 0 && active && r.height > bestH) { target = ul; bestH = r.height; }
+        }
+        if (!target) return {found: false, moved: false};
+        for (const it of target.querySelectorAll('.chatlist-chat')) {
+            const pid = (it.getAttribute('data-peer-id') || '').toLowerCase();
+            const href = (it.getAttribute('href') || '').replace(/^#/, '').toLowerCase();
+            if (refN === pid || refN === href) {
+                it.scrollIntoView({block: 'center'});
+                return {found: true, moved: false};
+            }
+        }
+        let sc = target;
+        while (sc && !(sc.classList && sc.classList.contains('scrollable-y')))
+            sc = sc.parentElement;
+        if (sc) {
+            const before = sc.scrollTop;
+            sc.scrollTop = Math.min(sc.scrollTop + sc.clientHeight * 0.8, sc.scrollHeight);
+            return {found: false, moved: sc.scrollTop !== before};
+        }
+        return {found: false, moved: false};
+    }"""
+
+    _SCROLL_TOP_JS = r"""() => {
+        const uls = [...document.querySelectorAll('ul.chatlist')];
+        for (const ul of uls) {
+            const r = ul.getBoundingClientRect();
+            if (r.height > 0) {
+                let sc = ul;
+                while (sc && !(sc.classList && sc.classList.contains('scrollable-y')))
+                    sc = sc.parentElement;
+                if (sc) sc.scrollTop = 0;
+            }
+        }
+    }"""
+
+    async def _scroll_find(self, ref, deadline):
+        """在当前可见面板内滚动查找目标会话（含一次回顶重扫）。
+
+        找到后滚到可见处并返回元素句柄；点击由调用方执行（避免双击）。
+        """
+        wrapped = False
+        rounds = 0
+        while time.monotonic() < deadline:
+            rounds += 1
+            res = await self.page.evaluate(self._SCROLL_FIND_JS, str(ref).strip().lstrip("#"))
+            log.debug("scroll_find %s round %d: found=%s moved=%s",
+                      ref, rounds, res.get("found"), res.get("moved"))
+            if res.get("found"):
+                r = str(ref).strip().lstrip("#")
+                candidates = self.page.locator(
+                    f'.chatlist-chat[data-peer-id="{r}"], '
+                    f'.chatlist-chat[href="#{r}"]')
+                for index in range(await candidates.count()):
+                    item = candidates.nth(index)
+                    if await item.is_visible() and not await item.evaluate("el=>!!el.closest('.topics-slider')"):
+                        return item
+                return None
+            if not res.get("moved"):
+                if not wrapped:
+                    wrapped = True
+                    log.debug("scroll_find %s: 到底，回顶重扫", ref)
+                    try:
+                        await self.page.evaluate(self._SCROLL_TOP_JS)
+                        await asyncio.sleep(0.5)
+                        continue
+                    except Exception:
+                        return None
+                log.debug("scroll_find %s: 二次到底仍未找到", ref)
+                return None
+            await asyncio.sleep(0.35)
+        log.debug("scroll_find %s: 超时（%d 轮）", ref, rounds)
+        return None
+
+    async def _list_folders_raw(self):
+        try:
+            return await self.page.evaluate("""() => {
+                const bar = document.querySelector('.folders-tabs-scrollable');
+                if (!bar) return [];
+                const names = [], seen = [];
+                for (const el of bar.querySelectorAll('*')) {
+                    let direct = '';
+                    for (const n of el.childNodes)
+                        if (n.nodeType === 3) direct += n.textContent;
+                    direct = direct.trim();
+                    if (!direct || direct.length > 16) continue;
+                    const name = direct.replace(/\\s*\\d+$/, '').trim();
+                    if (!name || seen.includes(name)) continue;
+                    seen.push(name);
+                    names.push(name);
+                }
+                return names;
+            }""")
+        except Exception:
+            return []
+
+
+
+
+
+    async def _open_via_folder(self, chat_ref, folder_name, topic=None):
+        """One exact folder, one group row, one topic row; wait only for actual readiness."""
+        ref = str(chat_ref).strip().lstrip('#')
+        try:
+            folder = await self.page.evaluate_handle(r"""name => {
+                const items = [...document.querySelectorAll('.menu-horizontal-div-item')].filter(e=>e.checkVisibility());
+                const label = el => {
+                    const clone = el.cloneNode(true);
+                    clone.querySelectorAll('.badge, .badge-unread, .unread-count').forEach(e=>e.remove());
+                    return clone.textContent.trim();
+                };
+                const target = items.find(e=>label(e)===name) || items.find(e=>e.textContent.trim().replace(/\s*\d+$/, '')===name);
+                return target || null;
+            }""", str(folder_name))
+            tab = folder.as_element()
+            if tab is None:
+                await folder.dispose()
+                return False
+            try:
+                if 'active' not in (await tab.get_attribute('class') or '').split():
+                    await tab.click(timeout=2000)
+            finally:
+                await folder.dispose()
+            # Exclude topic rows and hidden virtual-list copies of the same peer.
+            pick = r"""options => {
+                const rows = [...document.querySelectorAll('.chatlist-chat[data-peer-id]')];
+                const row = rows.find(e=>e.getAttribute('data-peer-id')===options.peer && e.checkVisibility() && !e.closest('.topics-slider') &&
+                    (!e.closest('.tabs-tab') || e.closest('.tabs-tab').classList.contains('active')));
+                if (!row) return false;
+                return true;
+            }"""
+            handle = await self.page.wait_for_function(pick, arg={'peer':ref}, timeout=3500, polling='raf')
+            await handle.dispose()
+            if topic:
+                state = await self.page.evaluate(self._CHAT_VIEW_JS, {'peer':ref,'title':str(topic).strip()})
+                if state['matches']:
+                    return await self._enter_topic(str(topic), timeout=5)
+            row = self.page.locator(f'.chatlist-chat[data-peer-id="{ref}"]:not(.topics-slider *):visible').first
+            await row.click(timeout=2500)
+            if topic:
+                return await self._enter_topic(str(topic), timeout=5)
+            return await self._wait_opened(ref, timeout=3)
+        except TopicSelectionError:
+            raise
+        except Exception as error:
+            log.debug('文件夹直达未完成：%s', error)
+            return False
+
+    async def _close_topic_panel(self):
+        """Close only the frontmost forum drawer, ignoring cached offscreen panels."""
+        target_js = r"""() => [...document.querySelectorAll('.topics-slider .sidebar-close-button')].find(b=>{
+            const r=b.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
+            if(!b.checkVisibility()||!r.width||!r.height||x<0||y<0||x>=innerWidth||y>=innerHeight)return false;
+            const top=document.elementFromPoint(x,y);return top===b||b.contains(top);
+        }) || null"""
+        for _ in range(3):
+            handle=await self.page.evaluate_handle(target_js)
+            button=handle.as_element()
+            if button is None:
+                await handle.dispose()
+                return
+            try:
+                await button.click(timeout=1200)
+            except Exception:
+                pass  # The drawer may have removed itself during the click.
+            finally:
+                await handle.dispose()
+            await asyncio.sleep(.15)
+        handle=await self.page.evaluate_handle(target_js)
+        try:
+            if handle.as_element() is not None:
+                raise RuntimeError('话题面板仍在切换，未能可靠关闭；未发送')
+        finally:
+            await handle.dispose()
+
+    async def _open_by_search(self, name, want_num=None):
+        """Search by title, but select only a visible result with the exact peer ID."""
+        if want_num is None:
+            return False
+        await self._close_topic_panel()
+        ref = str(want_num)
+        bare = str(name).replace('【', '').replace('】', '').strip()
+        queries = list(dict.fromkeys([bare, bare[-6:]]))
+        for query in queries:
+            try:
+                box = await self._first(SEL_SEARCH, timeout=1500)
+                await box.click(timeout=1500)
+                await box.fill('',timeout=1500)
+                await box.type(query, delay=30,timeout=2000)
+                await box.press('Enter',timeout=1500)
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    candidates = self.page.locator('.search-super .row, .search-super a, .chatlist-chat')
+                    for index in range(await candidates.count()):
+                        row = candidates.nth(index)
+                        if not await row.is_visible():
+                            continue
+                        if await row.get_attribute('data-peer-id') != ref and await row.get_attribute('href') != '#' + ref:
+                            continue
+                        await row.click(timeout=1500)
+                        if await self._wait_opened(ref, timeout=2):
+                            return True
+                    await asyncio.sleep(.2)
+            except Exception as error:
+                log.debug('搜索定位 %s 失败：%s', ref, error)
+        return False
+
+    def _remember_topic(self, peer, topic, thread):
+        previous = self._topic_ids.setdefault(peer, {}).get(topic)
+        self._topic_ids[peer][topic] = thread
+        self._expected_topic_id = thread
+        if previous != thread and self.browser is not None:
+            try:
+                atomic_write(self.profile / 'checkin-topics.json', json.dumps(self._topic_ids, ensure_ascii=False))
+            except OSError as error:
+                log.debug('话题导航缓存未保存：%s', error)
+
+    async def _enter_topic(self, topic, timeout=5):
+        """Resolve within the exact forum, click once by thread ID, verify live chrome."""
+        peer, topic = str(self._expected_peer), str(topic).strip()
+        deadline, started = time.monotonic() + timeout, time.monotonic()
+        configured = self._configured_topic_id
+        cached = configured or self._topic_ids.get(peer, {}).get(topic)
+        options = {'peer':peer,'title':topic,'id':cached}
+        state_js = """options => {
+            const state = (""" + self._CHAT_VIEW_JS + """)(options);
+            const info = state.info;
+            const opened = info.pid===options.peer && info.composer_peer===options.peer && info.title===options.title &&
+                info.topic_id && (!options.id || info.topic_id===options.id);
+            return opened || state.matches.length ? state : false;
+        }"""
+        opened_js = """options => {
+            const info = (""" + self._CHAT_VIEW_JS + """)();
+            return info.pid===options.peer && info.composer_peer===options.peer && info.title===options.title &&
+                info.topic_id===options.id ? info : false;
+        }"""
+        try:
+            handle = await self.page.wait_for_function(state_js, arg=options, timeout=max(1,int(timeout*1000)), polling='raf')
+            state = await handle.json_value()
+            await handle.dispose()
+            if configured:
+                state['matches'] = [thread for thread in state['matches'] if thread == configured]
+                if not state['matches'] and state['info'].get('topic_id') != configured:
+                    raise TopicSelectionError('所选话题 ID 已不可用或名称已改变，请在规则中重新选择话题；未发送')
+            if len(state['matches']) > 1:
+                raise TopicSelectionError(f'目标群内存在多个同名话题「{topic}」，已停止选择以避免误发')
+            info = state['info']
+            if (info.get('pid') == peer and info.get('composer_peer') == peer and info.get('title') == topic
+                    and info.get('topic_id') and (not cached or info['topic_id'] == cached)):
+                self._remember_topic(peer, topic, info['topic_id'])
+                via = 'already_open'
+            else:
+                thread = state['matches'][0]
+                # Re-resolve the same identity if Telegram re-renders its virtual list.
+                row = self.page.locator(f'.topics-slider .topics-container a[data-peer-id="{peer}"][data-thread-id="{thread}"]:visible').first
+                await row.click(timeout=max(1,int((deadline-time.monotonic())*1000)))
+                remaining = max(1,int((deadline-time.monotonic())*1000))
+                handle = await self.page.wait_for_function(opened_js, arg={**options,'id':thread}, timeout=remaining, polling='raf')
+                await handle.dispose()
+                self._remember_topic(peer, topic, thread)
+                via = 'exact_thread'
+            self.last_topic_selection = {'peer':peer,'topic':topic,'topic_id':self._expected_topic_id,
+                                         'via':via,'seconds':round(time.monotonic()-started,3)}
+            log.info('话题已核对「%s」ID=%s，%.3f 秒', topic, self._expected_topic_id, time.monotonic()-started)
+            return True
+        except TopicSelectionError:
+            raise
+        except Exception as error:
+            log.debug('话题「%s」在预算内未就绪：%s', topic, error)
+            return False
+
+    async def _current_topic(self):
+        return (await self.opened_chat_info()).get('title', '')
+
+    async def _open_visible_chat(self, peer):
+        """Use an exact row in the active chat list before trying slower fallbacks."""
+        handle = await self.page.evaluate_handle(r'''peer => [...document.querySelectorAll('.chatlist-chat[data-peer-id]')].find(el=>{
+            if(el.getAttribute('data-peer-id')!==peer||!el.checkVisibility()||el.closest('.topics-slider'))return false;
+            const pane=el.closest('.tabs-tab');return !pane||pane.classList.contains('active');
+        }) || null''',str(peer))
+        try:
+            row = handle.as_element()
+            if row is None:
+                return False
+            await row.click(timeout=1200)
+            return True
+        except Exception:
+            return False
+        finally:
+            await handle.dispose()
+
+    async def open_chat(self, chat_ref, title=None, topic=None, folder=None, topic_id=None):
+        await self._assert_media_clear()
+        ref = str(chat_ref).strip().lstrip("#")
+        self._mids_chat = ref
+        self.last_sent_mids = self._sent_by_chat.setdefault(ref, set())
+        self._expected_peer = ref if ref.lstrip("-").isdigit() else self._resolved_peers.get(ref.lower())
+        self._last_actual_peer = None
+        self._expected_topic = str(topic) if topic else None
+        self._expected_topic_id = None
+        self._configured_topic_id = str(topic_id) if topic_id else None
+        try:
+            await asyncio.wait_for(self._navigate(ref, title, topic, folder), timeout=45)
+            await self.assert_destination()
+        except asyncio.TimeoutError as error:
+            raise RuntimeError(f"打开 {title or ref} 超过 45 秒；未发送，请检查会话是否仍可访问") from error
+
+    async def _navigate(self, ref, title, topic, folder):
+        async def ready(timeout=3):
+            if topic:
+                if not await self._enter_topic(str(topic), timeout=timeout):
+                    return False
+            elif not await self._wait_opened(ref, timeout=timeout):
+                return False
+            try:
+                await self._first(SEL_COMPOSER, timeout=1500)
+                await self.assert_destination()
+                return True
+            except RuntimeError:
+                return False
+
+        if ref.startswith("@") and not self._expected_peer:
+            # Resolve a username from an actual matching search result, never its hash.
+            box = await self._first(SEL_SEARCH, timeout=1500)
+            await box.fill("")
+            await box.type(ref, delay=30)
+            await asyncio.sleep(1.5)
+            candidates = self.page.locator('.search-super .row, .chatlist-chat')
+            for index in range(await candidates.count()):
+                candidate = candidates.nth(index)
+                if not await candidate.is_visible():
+                    continue
+                username = await candidate.get_attribute('data-username') or ''
+                text = await candidate.inner_text()
+                if username.lstrip('@').lower() == ref[1:].lower() or ref.lower() in text.lower().split():
+                    pid = await candidate.get_attribute('data-peer-id')
+                    if pid and pid.lstrip('-').isdigit():
+                        self._resolved_peers[ref.lower()] = pid
+                        self._expected_peer = pid
+                        await candidate.click()
+                        if await ready():
+                            return
+            raise RuntimeError("无法可靠解析 @用户名，请从会话列表选用数字 ID；未发送")
+        if topic:
+            info = await self.opened_chat_info()
+            if info.get('pid') == self._expected_peer and info.get('title') == str(topic).strip() and info.get('topic_id'):
+                if await ready(.2):
+                    return
+            state = await self.page.evaluate(self._CHAT_VIEW_JS, {'peer':self._expected_peer,'title':str(topic).strip()})
+            if state['matches'] and await ready(5):
+                return
+        elif str(await self._opened_peer()) == str(self._expected_peer):
+            if await ready(.2):
+                return
+        await self._close_topic_panel()
+        if not topic and await self._open_visible_chat(self._expected_peer) and await ready(2):
+            return
+        if topic and folder and await self._open_via_folder(ref, folder, topic):
+            await self.assert_destination()
+            return
+        await self.page.evaluate("h => { location.hash = h; }", ref)
+        if await ready(2):
+            return
+        if folder and not topic and await self._open_via_folder(ref, folder, topic) and await ready(2):
+            return
+        item = await self._scroll_find(ref, time.monotonic() + 5)
+        if item is not None:
+            try:
+                await self._close_topic_panel()
+                await item.click(timeout=2500)
+                if await ready(3):
+                    return
+            except Exception as error:
+                log.debug('列表定位失败，改用搜索：%s', error)
+        if title and await self._open_by_search(str(title), int(self._expected_peer)) and await ready(3):
+            return
+        await self.page.reload(wait_until="domcontentloaded", timeout=12000)
+        if await ready(5):
+            return
+        if title and await self._open_by_search(str(title), int(self._expected_peer)) and await ready(3):
+            return
+        # A route can finish rendering just after a fallback exhausts its budget.
+        # Recheck both the composer and destination before reporting a failure.
+        if await ready(.5):
+            return
+        actual = await self._opened_peer()
+        self._last_actual_peer = actual
+        if str(actual) == str(self._expected_peer) and not topic:
+            raise RuntimeError(f"目标会话 {title or ref} 已打开，但发送输入框尚未就绪或不可用；本次未发送。请先只读体检确认输入框可用后再重试")
+        raise RuntimeError(f"未能打开 {title or ref}：目标 {self._expected_peer}，当前 {actual or '无'}；未发送。请从会话列表重新选择目标")
+
+    async def probe_chat(self, chat_ref, title=None, topic=None, folder=None, method=None, topic_id=None):
+        started = time.monotonic()
+        result = {"chat": str(chat_ref), "name": title or str(chat_ref), "ok": False,
+                  "via": "verified", "composer": False, "send_btn": False, "error": None}
+        try:
+            await self.open_chat(chat_ref, title, topic, folder, topic_id)
+            result["composer"] = await self._visible(SEL_COMPOSER)
+            result["send_btn"] = await self._visible(SEL_SEND)
+            if method in ("image_text", "image_only"):
+                result["attachment"] = await self._visible(['attach-menu-button', '.attach-file', "[aria-label='Chat.Input.Attach']"])
+                if not result["attachment"]:
+                    raise RuntimeError("目标已核对，但附件入口不可用")
+            result["ok"] = result["composer"]
+        except Exception as error:
+            result["error"] = str(error)
+        result["elapsed"] = round(time.monotonic() - started, 2)
+        return result
+
+
+    async def _composer_text(self):
+        try:
+            return await self.page.evaluate("""() => {
+                const el = [...document.querySelectorAll(
+                    "div[contenteditable='true'].input-message-input, div[contenteditable='true'][data-peer-id]")].find(e=>e.checkVisibility());
+                return el ? el.textContent.trim() : '';
+            }""")
+        except Exception:
+            return ""
+
+    @asynccontextmanager
+    async def preserve_draft(self):
+        """Suspend this peer/topic's draft, then restore it without sending it."""
+        self.last_draft_warning = None
+        self._automation_text = None
+        await self.assert_destination()
+        composer = await self._first(SEL_COMPOSER)
+        text, html = await composer.inner_text(), await composer.inner_html()
+        has_atoms = await composer.locator('img,custom-emoji-element,[data-type="mention"]').count()
+        if not text.strip() and not has_atoms:
+            yield
+            return
+        record = {'peer':str(self._expected_peer),'topic':self._expected_topic,
+                  'topic_id':self._expected_topic_id,'text':text,'html':html,'created':time.time()}
+        backup = self.profile / 'checkin-drafts' / (uuid.uuid4().hex + '.json')
+        atomic_write(backup, json.dumps(record, ensure_ascii=False, indent=2))
+        try:
+            await composer.click()
+            await composer.press('ControlOrMeta+A')
+            await composer.press('Backspace')
+            if (await composer.inner_text()).strip():
+                raise RuntimeError('未能暂存输入框草稿，已停止发送')
+            yield
+        finally:
+            task=asyncio.create_task(self._restore_draft(record, backup))
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+
+    async def _restore_draft(self, record, backup):
+        try:
+            await self.assert_destination()
+            if str(self._expected_peer)!=record['peer'] or self._expected_topic_id!=record['topic_id']:
+                raise RuntimeError('当前会话或话题已改变')
+            composer=await self._first(SEL_COMPOSER,timeout=2000)
+            current=await composer.inner_text()
+            if current.strip():
+                if await composer.inner_html()==record['html']:
+                    backup.unlink(missing_ok=True)
+                    return
+                if current.strip()!=str(self._automation_text or '').strip():
+                    raise RuntimeError('输入框出现了新的草稿，已保留现有内容')
+                await composer.click();await composer.press('ControlOrMeta+A');await composer.press('Backspace')
+            await composer.click()
+            # Let Telegram's editor parse the same HTML/plain-text clipboard payload.
+            await composer.evaluate("""(el,record)=>{
+                const data=new DataTransfer();data.setData('text/html',record.html);data.setData('text/plain',record.text);
+                el.dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:data}));
+            }""",record)
+            await asyncio.sleep(.1)
+            fallback=False
+            if not (await composer.inner_text()).strip() and record['text'].strip():
+                await self.page.keyboard.insert_text(record['text'])
+                fallback=True
+            if (await composer.inner_text()).strip()!=record['text'].strip():
+                raise RuntimeError('编辑器恢复后的内容与原草稿不一致')
+            if fallback and any(tag in record['html'].lower() for tag in ('<strong','<em>','<a ','<code','custom-emoji','data-type="mention"')):
+                raise RuntimeError('草稿文字已恢复，富文本格式需要核对')
+            await asyncio.sleep(.25)  # Editor input events allow Telegram to sync its draft.
+            backup.unlink(missing_ok=True)
+            log.info('[%s] 已恢复原会话草稿',self.name)
+        except Exception as error:
+            self.last_draft_warning=f'原草稿恢复需核对：{error}；备份保留于 {backup}'
+            log.error('[%s] %s',self.name,self.last_draft_warning)
+
+    async def _send_completed(self):
+        """K 发送成功的标志：输入框已清空 且 发送按钮回到待机（record）态。
+
+        注意不能用"气泡数增加"判断——K 发送后会重载消息区 DOM，气泡数反而变少。
+        """
+        try:
+            if await self._composer_text():
+                return False
+            return await self.page.evaluate(
+                """() => { const el = document.querySelector('.btn-send');
+                   return el ? el.classList.contains('record') : true; }""")
+        except Exception:
+            return False
+
+    async def _last_out_mid(self):
+        """当前会话里我最后一条发出消息的 data-mid（没有则为 None）。"""
+        try:
+            return await self.page.evaluate(
+                "() => { const bs = [...document.querySelectorAll("
+                "'.bubbles .bubble.is-out')].filter(b=>b.checkVisibility());"
+                " return bs.length ? bs[bs.length - 1].getAttribute('data-mid')"
+                " : null; }")
+        except Exception:
+            return None
+
+    async def _track_sent_mid(self, pre_mid):
+        """发送完成后登记这条消息的 data-mid 到 last_sent_mids。
+
+        之后凡是气泡上 data-reply-to-mid 命中的 is-in 消息，都是
+        **明确回复给我这条消息**的——判定签到结果只采信它们，
+        群里别人发同样签到词得到的结果、群友互相回复的闲聊都不再混入。
+        bot 随后删除我的消息也不影响：mid 在发出的瞬间就登记好了。
+        """
+        boundary = self._capture_by_chat.get(self._mids_chat, {})
+        deadline = time.monotonic() + 12
+        existing = set(self.last_sent_mids)
+        observed_ids = set()
+        # Topic views may rebuild after Enter. Observe until an ID arrives, without
+        # resending; the old three-second deadline ended while the view was loading.
+        while time.monotonic() < deadline:
+            if boundary.get('peer'):
+                observed = await self.page.evaluate(self._IN_COLLECT_JS, {'peer': boundary['peer'], 'reset': False})
+                candidates = [record for record in observed.get('items', [])
+                              if record.get('out') and record['mid'] not in boundary.get('seen', set())
+                              and record['mid'] not in existing
+                              and record.get('ts', 0) >= int(boundary.get('cutoff', time.time()))]
+                if candidates:
+                    observed_ids.update(str(record['mid']) for record in candidates)
+                    self.last_sent_mids.update(observed_ids)
+                for old, new in observed.get('aliases', []):
+                    if str(old) in observed_ids:
+                        observed_ids.add(str(new))
+                        self.last_sent_mids.add(str(new))
+                if any(not record.get('pending') for record in candidates):
+                    return
+            mid = await self._last_out_mid()
+            if not boundary.get('peer') and mid and str(mid) != str(pre_mid):
+                self.last_sent_mids.add(str(mid))
+                return
+            await asyncio.sleep(0.12)
+        error = RuntimeError("仅捕获临时消息 ID，尚未确认服务器接收；请核对 Telegram，不要直接重发" if observed_ids else "未能登记新消息 ID，发送状态不明；请核对 Telegram，不要直接重发")
+        error.sent = True
+        error.uncertain = True
+        raise error
+
+    def _start_send_clock(self, capture_since=None):
+        self.send_started_at = time.time()
+        self.send_started_monotonic = time.monotonic()
+        boundary = self._capture_by_chat.get(self._mids_chat)
+        if boundary is not None:
+            boundary.update(cutoff=self.send_started_at if capture_since is None else capture_since, sent_at=self.send_started_at)
+
+    async def send_text(self, text):
+        await self._assert_media_clear()
+        await self.assert_destination()
+        if not text or not str(text).strip():
+            raise ValueError("签到文字不能为空")
+        if await self._composer_text():
+            raise RuntimeError("目标输入框已有草稿，已保留草稿并停止发送")
+        self._automation_text = str(text)
+        composer = await self._first(SEL_COMPOSER)
+        await composer.click()
+        pre_mid = await self._last_out_mid()
+        for index, line in enumerate(str(text).split("\n")):
+            if index:
+                await self.page.keyboard.press("Shift+Enter")
+            await self.page.keyboard.type(line, delay=random_delay(30, 80))
+        await self.assert_destination()
+        if self.before_send:
+            await self.before_send()
+        capture_since = time.time()
+        try:
+            await self.page.keyboard.press("Enter")
+        except Exception as original:
+            error = RuntimeError('发送按键结果待核对，请先核对消息，不要直接重发')
+            error.sent = error.uncertain = True
+            raise error from original
+        self._start_send_clock(capture_since)
+        for _ in range(30):
+            await asyncio.sleep(.1)
+            if not await self._composer_text():
+                await self._track_sent_mid(pre_mid)
+                return
+        error = RuntimeError("发送状态不明，输入框尚未清空；请先核对消息，勿直接重复发送")
+        error.sent = True
+        raise error
+
+    MEDIA_PREVIEW_SELECTOR = '.popup.popup-new-media:visible, .popup.popup-send-photo:visible'
+
+    async def _assert_media_clear(self):
+        if await self.page.locator(self.MEDIA_PREVIEW_SELECTOR).count():
+            raise RuntimeError('存在未关闭的图片预览，请先在 Telegram 处理；未执行新的发送或会话切换')
+
+    async def _media_control(self, preview, selectors, label, timeout=2000):
+        deadline = time.monotonic() + timeout / 1000
+        while time.monotonic() < deadline:
+            for selector in selectors:
+                for control in await preview.query_selector_all(selector):
+                    if await control.is_visible() and await control.is_enabled():
+                        return control
+            await asyncio.sleep(min(.1, max(0, deadline - time.monotonic())))
+        raise RuntimeError(f'图片预览的{label}不可用，未执行发送')
+
+    async def _dismiss_media_preview(self):
+        """Dismiss only the preview opened by this image attempt, before draft restore."""
+        preview = self._media_preview
+        try:
+            if preview is None and self._media_upload_started:
+                popup = self.page.locator(self.MEDIA_PREVIEW_SELECTOR)
+                if await popup.count() == 1:
+                    preview = await popup.element_handle()
+            if preview is None or not await preview.is_visible():
+                return
+            close = await preview.query_selector('button.popup-close, .popup-close')
+            if close is None:
+                raise RuntimeError('图片预览缺少关闭控件')
+            await close.click(timeout=1500)
+            await preview.wait_for_element_state('hidden',timeout=2000)
+        except Exception:
+            warning = '本轮图片预览未能关闭，请在 Telegram 核对；已停止后续会话切换'
+            self.last_draft_warning = '；'.join(filter(None,(self.last_draft_warning,warning)))
+        finally:
+            self._media_upload_started = False
+
+    async def _open_attach(self):
+        """点开附件菜单（K 版发图要先展开它）。"""
+        try:
+            el = await self._first(['attach-menu-button','.attach-file',"[aria-label='Chat.Input.Attach']"],timeout=2000)
+            await el.click(timeout=1500)
+            return True
+        except Exception:
+            return False
+
+    async def send_image(self, image_path, caption):
+        await self._assert_media_clear()
+        self._media_preview = None
+        self._media_upload_started = self._media_dispatch_attempted = False
+        try:
+            return await self._send_image(image_path,caption)
+        except Exception as error:
+            if self._media_dispatch_attempted:
+                error.sent = error.uncertain = True
+            raise
+        finally:
+            task = asyncio.create_task(self._dismiss_media_preview())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+
+    async def _send_image(self, image_path, caption):
+        """发图片（可带文字）。
+
+        K 版**不能**直接 set_input_files —— 实测初始 input[type=file] 存在但传文件
+        不产生任何预览。必须走：点附件按钮 → 点「图片或视频」→ 捕获文件选择框 →
+        在预览层的「添加说明」里填字 → 点预览层的发送按钮。
+        """
+        await self.assert_destination()
+        import pathlib
+        path = pathlib.Path(str(image_path))
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        if not path.is_file():
+            raise FileNotFoundError(f"图片不存在：{path}")
+        pre_mid = await self._last_out_mid()
+
+        # 1) 展开附件菜单 + 选中「图片或视频」，捕获文件选择框
+        try:
+            async with self.page.expect_file_chooser(timeout=10000) as fc_info:
+                if not await self._open_attach():
+                    raise RuntimeError("找不到附件按钮")
+                menu = await self._first([".btn-menu-item:has-text('图片或视频')",".btn-menu-item:has-text('Photo or Video')"],timeout=2500)
+                await menu.click(timeout=1500)
+            chooser = await fc_info.value
+            self._media_upload_started = True
+            await chooser.set_files(str(path))
+        except Exception as e:
+            raise RuntimeError(f"选择图片失败：{type(e).__name__}: {e}")
+
+        # 2) 等预览层出现（这是「图片真的进来了」的唯一可靠信号）
+        popup = await self._first([self.MEDIA_PREVIEW_SELECTOR],timeout=7000)
+        preview = self._media_preview = await popup.element_handle()
+        if preview is None:
+            raise RuntimeError('图片预览已关闭，未执行发送')
+
+        # 3) 说明文字填到预览层的输入框里（主输入框此时不是发送目标）
+        if caption:
+            el = await self._media_control(preview,['[contenteditable="true"]','textarea','input[placeholder]'],'说明输入框')
+            await el.click(timeout=1500)
+            await el.type(caption,delay=random_delay(30,80),timeout=30000)
+
+        await self.assert_destination()
+        # 4) 点预览层的发送按钮（Enter 在预览层不保证触发）
+        btn = await self._media_control(preview,['.simple-message-input-confirm','.btn-send'],'发送按钮')
+        if self.before_send:
+            await self.before_send()
+        capture_since = time.time()
+        self._media_dispatch_attempted = True
+        await btn.click(timeout=2000)
+        self._start_send_clock(capture_since)
+
+        # 5) 验证预览层消失 = 已发出
+        try:
+            await preview.wait_for_element_state('hidden',timeout=4000)
+        except Exception as error:
+            raise RuntimeError('图片发送结果待核对，请先核对消息，不要直接重发') from error
+        await self._track_sent_mid(pre_mid)
+
+    async def click_button(self, text_part, timeout=25):
+        await self.assert_destination()
+        boundary = self._capture_by_chat.get(self._mids_chat, {})
+        cutoff = boundary.get("cutoff", time.time())
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await self.assert_destination()
+            observed = await self.page.evaluate(self._IN_COLLECT_JS, {"peer": str(self._expected_peer), "reset": False})
+            for old, new in observed.get("aliases", []):
+                if str(old) in self.last_sent_mids:
+                    self.last_sent_mids.add(str(new))
+                if self._active_mids is not None and str(old) in self._active_mids:
+                    self._active_mids.add(str(new))
+            bubbles = self.page.locator('.bubbles .bubble.is-in')
+            for index in range(await bubbles.count() - 1, -1, -1):
+                bubble = bubbles.nth(index)
+                mid = await bubble.get_attribute('data-mid')
+                stamp = float(await bubble.get_attribute('data-timestamp') or 0)
+                reply_to = await bubble.get_attribute('data-reply-to-mid')
+                private = bool(self._expected_peer and str(self._expected_peer).isdigit())
+                allowed = self._active_mids if self._active_mids is not None else self.last_sent_mids
+                related = str(reply_to) in allowed or (private and stamp >= int(cutoff))
+                if not related or mid in boundary.get("seen", set()):
+                    continue
+                for selector in SEL_BTN_ROW:
+                    buttons = bubble.locator(selector)
+                    for button_index in range(await buttons.count()):
+                        button = buttons.nth(button_index)
+                        if await button.is_visible() and text_part in await button.inner_text():
+                            if await button.get_attribute('href'):
+                                raise RuntimeError("匹配到网址按钮，已停止自动点击")
+                            await self.assert_destination()
+                            await button.click(timeout=max(100, int((deadline - time.monotonic()) * 1000)))
+                            return True
+            await asyncio.sleep(min(.25, max(0, deadline - time.monotonic())))
+        return False
+
+    _LATEST_VIEW_JS = r"""({peer, element=false, align=false}) => {
+        const visible=(el,empty=false)=>{
+            if(!el?.checkVisibility())return false;
+            for(let p=el;p&&p!==document.body;p=p.parentElement){
+                if(Number(getComputedStyle(p).opacity)<.05)return false;
+            }
+            const r=el.getBoundingClientRect();
+            return r.width>0&&(empty||r.height>0)&&r.left<innerWidth&&r.right>0&&(empty||r.top<innerHeight&&r.bottom>0);
+        };
+        const button=[...document.querySelectorAll('button.bubbles-go-down')].find(b=>{
+            if(!visible(b)||b.disabled)return false;
+            const r=b.getBoundingClientRect(),top=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);
+            return top===b||b.contains(top);
+        });
+        if(element)return button||null;
+        const pane=[...document.querySelectorAll('.bubbles')].find(e=>visible(e,true));
+        const owner=button?.closest('.chat')||pane?.closest('.chat');
+        const pending=owner?owner.classList.contains('is-go-down-visible'):!!button;
+        const bubble=[...document.querySelectorAll('.bubbles .bubble[data-mid]')].find(b=>b.dataset.peerId===peer&&visible(b));
+        const empty=[...document.querySelectorAll('.bubbles-inner.no-messages')].some(e=>visible(e,true));
+        let scrolled=false;
+        const viewport=pane?.querySelector('.bubbles-scrollable');
+        const initial_loading=!!viewport&&!bubble&&!empty&&viewport.scrollHeight<=viewport.clientHeight+10;
+        if(align&&!bubble&&viewport&&viewport.scrollTop>=0&&viewport.scrollTop+viewport.clientHeight<viewport.scrollHeight-20){
+            const before=viewport.scrollTop;viewport.scrollTop=viewport.scrollHeight;scrolled=Math.abs(viewport.scrollTop-before)>1;
+        }
+        if(!owner&&!pending&&bubble){
+            for(let el=bubble.parentElement;el&&el!==document.body;el=el.parentElement){
+                if(el.scrollHeight>el.clientHeight+10&&el.scrollTop>=0&&el.scrollTop+el.clientHeight<el.scrollHeight-20){
+                    const before=el.scrollTop;el.scrollTop=el.scrollHeight;scrolled||=Math.abs(el.scrollTop-before)>1;
+                }
+            }
+        }
+        return {ready:!!bubble||empty,has_jump:pending,clickable:!!button,scrolled,initial_loading};
+    }"""
+
+    async def _scroll_chat_bottom(self):
+        await self.assert_destination()
+        deadline=time.monotonic()+18
+        attempts=0;last_click=0;settled=None
+        while time.monotonic()<deadline:
+            current=time.monotonic()
+            state=await self.page.evaluate(self._LATEST_VIEW_JS,{'peer':str(self._expected_peer),'align':attempts>0})
+            if state['has_jump'] and state['clickable'] and not state['initial_loading'] and attempts<6 and current-last_click>=(.8 if state['ready'] else 2):
+                handle=await self.page.evaluate_handle(self._LATEST_VIEW_JS,{'peer':str(self._expected_peer),'element':True})
+                try:
+                    button=handle.as_element()
+                    if button:
+                        attempts+=1;last_click=current
+                        try:await button.click(timeout=800)
+                        except Exception:pass  # The navigation control can disappear during a valid jump.
+                finally:await handle.dispose()
+            if (state['ready'] or str(self._expected_peer).isdigit()) and not state['initial_loading'] and not state['has_jump'] and not state['scrolled']:
+                settled=settled or current
+                if current-settled>=.15:
+                    await self.assert_destination()
+                    return
+            else:settled=None
+            await asyncio.sleep(.08)
+        raise RuntimeError('无法同步到最新消息，已停止发送以避免漏抓反馈；请在 Telegram 核对')
+
+
+    _IN_COLLECT_JS = r"""(options) => {
+        let capture = window.__checkinCapture;
+        if (!capture || capture.peer !== options.peer || options.reset) {
+            if (capture) capture.observer.disconnect();
+            capture = {peer:options.peer, records:new Map(), ids:new WeakMap(), aliases:[], observer:null};
+            capture.read = b => {
+                    if (!b.matches?.('.bubble[data-mid]') || b.getAttribute('data-peer-id') !== options.peer) return;
+                    const mid=b.getAttribute('data-mid'), previous=capture.ids.get(b);
+                    if(previous && previous!==mid) capture.aliases.push([previous,mid]);
+                    capture.ids.set(b,mid);
+                    const message=b.querySelector('.message');
+                    const t=(message?message.textContent:b.textContent||'').trim().replace(/(\s*\d{1,2}:\d{2}){1,2}\s*$/, '');
+                    const record={mid,t,rm:b.getAttribute('data-reply-to-mid'),ts:Number(b.getAttribute('data-timestamp')||0),
+                                  peer:options.peer,out:b.classList.contains('is-out'),pending:b.classList.contains('is-sending')||mid.includes('.')};
+                    capture.records.set(mid,record);
+                    if(capture.records.size>1000)capture.records.delete(capture.records.keys().next().value);
+            };
+            capture.scan = () => document.querySelectorAll('.bubbles .bubble[data-mid]').forEach(capture.read);
+            capture.observer=new MutationObserver(mutations => {
+                // Bots can remove a command before the next poll, or even in the same DOM batch.
+                for (const mutation of mutations) {
+                    for (const node of [...mutation.addedNodes,...mutation.removedNodes]) {
+                        if (node.nodeType !== 1) continue;
+                        capture.read(node);
+                        node.querySelectorAll('.bubble[data-mid]').forEach(capture.read);
+                    }
+                }
+                capture.scan();
+            });
+            capture.observer.observe(document.body,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['data-mid','data-reply-to-mid','data-peer-id','data-timestamp','class']});
+            window.__checkinCapture=capture;
+        }
+        capture.scan();
+        return {items:[...capture.records.values()],aliases:capture.aliases.splice(0)};
+    }"""
+
+    async def snapshot_incoming(self, mode="after"):
+        self.send_started_at = None
+        self.send_started_monotonic = None
+        await self.assert_destination()
+        await self._scroll_chat_bottom()
+        await asyncio.sleep(.12)
+        data = await self.page.evaluate(self._IN_COLLECT_JS, {"peer": str(self._expected_peer), "reset": True})
+        baseline = {"seen": sorted({str(it["mid"]) for it in data.get("items", [])}), "versions": {},
+                    "cutoff": time.time(), "peer": str(self._expected_peer)}
+        self._capture_by_chat[self._mids_chat] = baseline
+        return baseline
+
+    async def watch_new_incoming(self, known, seconds, mode="after", idle_after=2.0, sent_mids=None, started_at=None, is_complete=None):
+        if not isinstance(known, dict) or not known.get("peer"):
+            raise ValueError("缺少本轮消息 ID/时间边界，不能安全补查旧记录")
+        seen = set(known.get("seen", []))
+        known["seen"] = sorted(seen)
+        known.setdefault("versions", {})
+        self._capture_by_chat[self._mids_chat] = known
+        deadline = (started_at if started_at is not None else time.monotonic()) + max(0, seconds)
+        found, replied, evidence = [], [], []
+        allowed = set(sent_mids) if sent_mids is not None else self.last_sent_mids
+        last_related = None
+        first_read = True
+        while first_read or time.monotonic() < deadline:
+            first_read = False
+            remaining = deadline - time.monotonic()
+            remaining = remaining if remaining > 0 else .1
+            try:
+                data = await asyncio.wait_for(self.page.evaluate(self._IN_COLLECT_JS, {"peer": known["peer"], "reset": False}), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            for old, new in data.get("aliases", []):
+                if str(old) in self.last_sent_mids:
+                    self.last_sent_mids.add(str(new))
+                if str(old) in allowed:
+                    allowed.add(str(new))
+            for record in data.get("items", []):
+                mid = str(record["mid"])
+                if record.get("out") or not record.get("t"):
+                    continue
+                if record.get("ts", 0) < int(known["cutoff"]):
+                    continue
+                if mid in seen and (mid not in known["versions"] or known["versions"][mid] == record["t"]):
+                    continue
+                exact = str(record.get("rm")) in allowed
+                private = str(known["peer"]).isdigit()
+                if not exact and not private and mode == "reply_only":
+                    continue
+                seen.add(mid)
+                known["seen"] = sorted(seen)
+                known["versions"][mid] = record["t"]
+                found.append(record["t"])
+                record = {**record, "source": "reply_to_sent" if exact else "private_chat" if private else "unrelated"}
+                evidence.append(record)
+                if exact or private:
+                    replied.append(record["t"])
+                    last_related = time.monotonic()
+            if last_related is not None and time.monotonic() - last_related >= idle_after and (is_complete is None or is_complete(replied)):
+                break
+            await asyncio.sleep(min(.2, max(0, deadline - time.monotonic())))
+        self.last_replied, self.last_evidence = replied, evidence
+        self.last_allowed_mids = sorted(allowed)
+        return found
+
+    async def _visible(self, selectors):
+        try:
+            await self._first(selectors, timeout=150)
+            return True
+        except RuntimeError:
+            return False
+
+
+    async def list_folders(self):
+        """列出 Telegram 的会话分组（文件夹）名称。只读，不发送任何消息。"""
+        await self.ensure_login()
+        await self.page.wait_for_timeout(1200)
+        return await self._list_folders_raw()
+
+    async def _open_folder(self, name):
+        """切换到指定分组标签（界面导航，不发送任何消息）。"""
+        try:
+            ok = await self.page.evaluate("""(name) => {
+                const bar = document.querySelector('.folders-tabs-scrollable');
+                if (!bar) return false;
+                let target = null;
+                for (const el of bar.querySelectorAll('*')) {
+                    let direct = '';
+                    for (const n of el.childNodes)
+                        if (n.nodeType === 3) direct += n.textContent;
+                    direct = direct.trim();
+                    if (!direct) continue;
+                    const base = direct.replace(/\\s*\\d+$/, '').trim();
+                    if (base === name) { target = el; break; }
+                }
+                if (!target) return false;
+                target.click();  // 事件冒泡到 K 的分组切换处理器
+                return true;
+            }""", name)
+            if not ok:
+                return False
+            await self.page.wait_for_timeout(1500)
+            return True
+        except Exception:
+            return False
+
+    _TOPICS_JS = r"""({peer,scroll=false}) => {
+        const visible=e=>{if(!e?.checkVisibility())return false;const r=e.getBoundingClientRect();return r.right>0&&r.left<innerWidth&&r.bottom>0&&r.top<innerHeight};
+        const pane=[...document.querySelectorAll('.topics-slider .topics-container')].find(p=>visible(p)&&
+            p.querySelector('.sidebar-header .peer-title[data-peer-id], .sidebar-header__title .peer-title[data-peer-id]')?.getAttribute('data-peer-id')===peer);
+        if(!pane)return null;
+        const items=[...pane.querySelectorAll('a[data-peer-id][data-thread-id]')].filter(e=>e.dataset.peerId===peer&&/^[1-9]\d*$/.test(e.dataset.threadId)).map(e=>({
+            id:e.dataset.threadId,title:e.querySelector('.row-title .peer-title')?.textContent.trim()||'',
+            closed:!!e.querySelector('.topic-closed, .tgico-lock')
+        })).filter(e=>e.title);
+        const sc=pane.querySelector('.scrollable-y');let moved=false;
+        if(sc&&scroll){const before=sc.scrollTop;sc.scrollTop+=Math.max(100,sc.clientHeight*.8);moved=sc.scrollTop>before;}
+        return {is_forum:true,items,moved};
+    }"""
+
+    async def list_topics(self, chat_ref, title=None, folder=None):
+        """Identify the exact peer and read its topic drawer; never touch a composer."""
+        peer=str(chat_ref)
+        if not peer.lstrip('-').isdigit():
+            raise ValueError('请从会话列表选择数字 ID，再读取话题')
+        if not peer.startswith('-'):
+            return {'is_forum':False,'topics':[]}
+        await self.ensure_login()
+        current=await self.page.evaluate(self._TOPICS_JS,{'peer':peer})
+        if not current:
+            await self._close_topic_panel()
+            await self.page.evaluate('peer=>{location.hash=peer}',peer)
+            ready_js="""peer=>{
+                const topics=("""+self._TOPICS_JS+""")({peer});
+                if(topics)return topics;
+                const info=("""+self._CHAT_VIEW_JS+""")();
+                const row=[...document.querySelectorAll('.chatlist-chat')].find(e=>e.dataset.peerId===peer&&!e.closest('.topics-slider'));
+                if(info.pid===peer&&!info.topic_id&&!row?.querySelector('.is-forum'))return {is_forum:false};
+                return false;
+            }"""
+            try:
+                handle=await self.page.wait_for_function(ready_js,arg=peer,timeout=3500)
+            except Exception:
+                if folder:await self._open_folder(folder)
+                row=await self._scroll_find(peer,time.monotonic()+5)
+                if row is not None:await row.click(timeout=2500)
+                elif title:await self._open_by_search(str(title),int(peer))
+                handle=await self.page.wait_for_function(ready_js,arg=peer,timeout=6000)
+            current=await handle.json_value();await handle.dispose()
+        if not current['is_forum']:
+            return {'is_forum':False,'topics':[]}
+        found={};stable=0;deadline=time.monotonic()+15
+        while time.monotonic()<deadline:
+            data=await self.page.evaluate(self._TOPICS_JS,{'peer':peer,'scroll':True})
+            if not data:raise RuntimeError('话题面板已改变，请重新读取')
+            before=len(found)
+            for item in data['items']:found[item['id']]=item
+            stable=stable+1 if not data['moved'] and len(found)==before else 0
+            if stable>=3:break
+            await asyncio.sleep(.2)
+        if stable<3:raise RuntimeError('话题列表尚未加载完整，请刷新话题')
+        if not found:raise RuntimeError('已识别论坛群，但未读取到话题，请刷新后选择')
+        return {'is_forum':True,'topics':list(found.values())}
+
+    async def list_chats(self, folder=None, on_progress=None):
+        """列出账号内的会话（可指定分组名，滚动加载全量）。
+
+        只读取页面元素：不点击会话、不发送任何消息。K 的会话列表是虚拟
+        渲染，必须逐步滚动才能让全部会话进入 DOM。
+        """
+        await self.ensure_login()
+        await self.page.wait_for_timeout(1200)
+        if folder:
+            if not await self._open_folder(folder):
+                raise RuntimeError(f'文件夹「{folder}」不存在或无法打开')
+        else:
+            for name in ('所有', 'All', 'All Chats', '全部', '全部聊天', '所有聊天'):
+                if await self._open_folder(name):
+                    break
+        await self.page.evaluate(self._SCROLL_TOP_JS)
+        await asyncio.sleep(.15)
+        js = r"""() => {
+            const uls = [...document.querySelectorAll('ul.chatlist')];
+            let target = null, bestH = 0;
+            for (const ul of uls) {
+                const tab = ul.closest('.tabs-tab');
+                const active = !tab || tab.className.includes('active');
+                const r = ul.getBoundingClientRect();
+                if (ul.checkVisibility() && !ul.closest('.topics-slider') && r.height > 0 && active && r.height > bestH) { target = ul; bestH = r.height; }
+            }
+            if (!target) return {items: [], moved: false};
+            const items = [...target.querySelectorAll('.chatlist-chat')].map(el => ({
+                pid: el.getAttribute('data-peer-id'),
+                is_forum: !!el.querySelector('.is-forum'),
+                title: ((el.querySelector('.user-title, .peer-title') || {})
+                        .textContent || '').trim(),
+            }));
+            let sc = target;
+            while (sc && !(sc.classList && sc.classList.contains('scrollable-y')))
+                sc = sc.parentElement;
+            let moved = false;
+            if (sc) {
+                const before = sc.scrollTop;
+                sc.scrollTop = Math.min(sc.scrollTop + sc.clientHeight * 0.8, sc.scrollHeight);
+                moved = sc.scrollTop !== before;
+            }
+            return {items, moved};
+        }"""
+        result, seen = [], set()
+        stable = 0
+        for step in range(250):
+            data = await self.page.evaluate(js)
+            added = 0
+            for it in data.get("items", []):
+                pid = it.get("pid")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    added += 1
+                    result.append({"id": pid, "title": it.get("title") or "", "is_forum": bool(it.get('is_forum')),
+                                   "type": "论坛群 · 含话题" if it.get('is_forum') else "私聊/机器人" if not str(pid).startswith("-")
+                                   else "群组/频道"})
+            if on_progress:
+                try:
+                    on_progress(len(result))
+                except Exception:
+                    pass
+            if on_progress is None and added and \
+                    (len(result) // 50) > ((len(result) - added) // 50):
+                log.info("已读取 %d 个会话…", len(result))
+            if not data.get("moved") and not added:
+                stable += 1
+                if stable >= 3:
+                    break
+            else:
+                stable = 0
+            await asyncio.sleep(0.3)
+        # 回到列表顶部，避免影响后续操作
+        try:
+            await self.page.evaluate("""() => {
+                const uls = [...document.querySelectorAll('ul.chatlist')];
+                for (const ul of uls) {
+                    const r = ul.getBoundingClientRect();
+                    if (r.height > 0) {
+                        let sc = ul;
+                        while (sc && !(sc.classList && sc.classList.contains('scrollable-y')))
+                            sc = sc.parentElement;
+                        if (sc) sc.scrollTop = 0;
+                    }
+                }
+            }""")
+        except Exception:
+            pass
+        return result
+
+
+
+def random_delay(lo, hi):
+    import random
+    return random.randint(lo, hi)
+
+
+# ---------- 单命令入口 ----------
+
+def load_cfg():
+    import yaml
+    path = BASE_DIR / "config.yaml"
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def find_account(cfg, name):
+    for acc in cfg.get("accounts") or []:
+        if acc.get("name") == name:
+            return acc
+    sys.exit(f"config.yaml 里找不到账号：{name}")
+
+
+async def cmd_login(name):
+    cfg = load_cfg()
+    acc = find_account(cfg, name)
+    if not await WebEngine(acc, cfg).login_interactive():
+        raise SystemExit("登录未完成")
+
+
+async def cmd_test(name):
+    cfg = load_cfg()
+    acc = find_account(cfg, name)
+    eng = WebEngine(acc, cfg)
+    await eng.launch()
+    try:
+        ok = await eng.is_logged_in()
+        print("登录状态：", "✅ 有效" if ok else "❌ 失效（需要重新 login）")
+        if ok:
+            eng.marker().write_text("ok", encoding="utf-8")
+    finally:
+        await eng.close()
+
+
+if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    if len(sys.argv) < 3 or sys.argv[1] not in ("login", "test"):
+        print(__doc__)
+        sys.exit(1)
+    asyncio.run({"login": cmd_login, "test": cmd_test}[sys.argv[1]](sys.argv[2]))

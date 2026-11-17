@@ -1,0 +1,81 @@
+# 配置示例 —— 复制成 config.yaml 后按自己的群改
+#
+# 隐私提醒：config.yaml 含真实群 ID 与群名，已在 .gitignore 里排除，不要提交。
+
+# 每个账号之间间隔
+account_delay_seconds: 2
+# 每个群之间间隔
+group_delay_seconds: 1
+# 发出后最多等多久收反馈（秒）。收到消息后再静默 2 秒即提前返回
+reply_wait_seconds: 6
+# 一轮跑完后，对「未确认」的群重新打开补看一轮（不重发消息），
+# 专治 bot 回复慢（如零点高峰期）。关掉则未确认的群只标记 ⚠ 不再补看
+reply_second_pass: true
+# 群聊仅明确关联本轮消息的回复可确认；after 可额外采集新消息供诊断
+reply_mode: reply_only
+# 可选：使用已安装的 Chrome / Edge（默认使用 Playwright Chromium）
+# web_browser_channel: msedge
+# 命令行是否后台运行；控制台手动任务另有“显示签到过程”选项，默认勾选
+web_headless: false
+
+# 每日定时（控制台和 python checkin.py --schedule 均可管理，勿同时运行）
+schedule:
+  enabled: false
+  time: '09:00'
+  timezone: Asia/Hong_Kong
+  headless: true
+  catch_up: true
+  accounts: []  # 空数组代表全部；也可填写账号名数组
+# Server酱：在 GUI 的定时与通知中另存密钥，或设置 SERVERCHAN_SENDKEY 环境变量
+notifications:
+  enabled: false
+  only_on_issues: false
+
+# 全局成功/失败判定词（群级配了就以群级为准）
+success_keywords:
+  - 签到成功
+  - 已经签到过了
+  - 无需重复签到
+fail_keywords:
+  - 签到失败
+  - 请先加入
+
+accounts:
+  - name: my_account          # 账号名，要和 web_profiles 下的目录名一致
+    groups:
+      # ① 最基本：发一句文字
+      - chat: '-1001234567890'
+        title: 示例群 A
+        method: text
+        message: 签到
+        reply_mode: after
+        success_keywords:
+          - 签到成功
+
+      # ② 命令式（斜杠指令）
+      - chat: '@example_bot'
+        title: 示例 Bot
+        method: command
+        message: /checkin
+
+      # ③ 论坛式群组：需要先点进指定话题；folder 指该群所在的文件夹名，
+      #    配上后可直接从文件夹打开（比搜索快很多）
+      - chat: '-1009876543210'
+        title: 示例论坛群
+        method: text
+        message: 签到
+        topic: 讨论区
+        is_forum: true
+        # topic_id: '4294967297'  # 推荐由 GUI 选择后自动填写，不要猜测 ID
+        folder: 签到
+
+      # ④ 一个群要发多步（例如先签到、再打卡）
+      - chat: '-1005555555555'
+        title: 示例多步群
+        reply_mode: after
+        actions:
+          - method: text
+            message: 签到
+          - method: image_text
+            message: 打卡
+            image: images/example.png

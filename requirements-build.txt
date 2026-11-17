@@ -1,0 +1,3 @@
+# Build dependencies; installed in addition to requirements.lock.txt.
+PyInstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9

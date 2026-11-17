@@ -1,0 +1,25 @@
+[Unit]
+Description=Telegram check-in dashboard and daily scheduler
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=telegram-checkin
+Group=telegram-checkin
+WorkingDirectory=/opt/telegram-checkin
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+Environment=CHECKIN_NO_BROWSER=1
+Environment=CHECKIN_HOME=/var/lib/telegram-checkin
+StateDirectory=telegram-checkin
+EnvironmentFile=-/etc/telegram-checkin.env
+ExecStart=/opt/telegram-checkin/telegram-checkin --gui
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+KillSignal=SIGINT
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
