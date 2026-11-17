@@ -37,6 +37,7 @@ def findings(data, name, values):
 
 
 def check(root=ROOT, history=False, additional_private_values=()):
+    root=Path(root).resolve()
     values=[*private_values(root),*additional_private_values];files=source_files(root)
     issues=[]
     manifest=json.loads((root/'docs/assets/manifest.json').read_text(encoding='utf-8')) if (root/'docs/assets/manifest.json').exists() else {}

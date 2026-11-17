@@ -22,6 +22,14 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 class DistributionTests(unittest.TestCase):
+    def test_privacy_scan_normalizes_relative_roots(self):
+        (ROOT/'audit').mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=ROOT/'audit') as directory:
+            root=Path(directory);(root/'README.md').write_text('Anonymous fixture')
+            subprocess.run(['git','init',str(root)],check=True,capture_output=True)
+            relative=Path(os.path.relpath(root,Path.cwd()))
+            self.assertTrue(privacy_check.check(relative)['passed'])
+
     def test_privacy_scan_can_add_local_patterns_without_copying_config(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);(root/'README.md').write_text('FixturePrivateIdentity')
