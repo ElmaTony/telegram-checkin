@@ -60,9 +60,14 @@ async def main():
   if path=='/api/logs':return await route.fulfill(json={'ok':True,'text':'2026-10-30 [INFO] 本地测试日志\n'})
   return await route.fulfill(body='fixture data',content_type='text/plain')
 
+ async def click_api(page,button,path):
+  async with page.expect_response(lambda response:urlparse(response.url).path==path and response.request.method=='POST') as pending:
+   await button.click()
+  assert (await pending.value).ok
+
  async def confirm_scoped_job(page,account,chats):
   assert await page.get_by_role('checkbox',name='显示签到过程',exact=False).is_checked()
-  await page.get_by_role('button',name='确认发送',exact=True).click()
+  await click_api(page,page.get_by_role('button',name='确认发送',exact=True),'/api/checkin_now')
   await page.get_by_role('button',name='取消任务',exact=True).first.wait_for()
   submitted=[p for p in posts if p['path']=='/api/checkin_now'][-1]['body']
   assert submitted=={'account':account,'chats':chats,'show_browser':True},submitted
@@ -112,14 +117,14 @@ async def main():
   await page.get_by_role('button',name='取消',exact=True).click()
   await page.get_by_role('textbox',name='账号名称',exact=True).fill('主账号')
   await page.get_by_role('button',name='签到工作台',exact=True).click()
-  await page.get_by_role('button',name='仅补查反馈：主账号 / 摄影交流',exact=True).click()
+  await click_api(page,page.get_by_role('button',name='仅补查反馈：主账号 / 摄影交流',exact=True),'/api/recheck')
   assert [p for p in posts if p['path']=='/api/recheck'][-1]['body']=={'account':'主账号','chats':['-102']}
   await page.get_by_role('button',name='取消任务',exact=True).first.click()
   await page.wait_for_function("document.querySelector('#job-banner').hidden")
   await page.get_by_role('textbox',name='搜索会话或账号').fill('')
   await page.get_by_role('combobox',name='筛选账号',exact=True).select_option('备用账号')
   assert await page.locator('.inspector h2').inner_text()=='开源讨论'
-  await page.get_by_role('button',name='只检查此群',exact=True).click()
+  await click_api(page,page.get_by_role('button',name='只检查此群',exact=True),'/api/probe')
   assert [p for p in posts if p['path']=='/api/probe'][-1]['body']=={'account':'备用账号','chats':['-201']}
   await page.get_by_role('button',name='取消任务',exact=True).first.click()
   await page.wait_for_function("document.querySelector('#job-banner').hidden")
@@ -136,8 +141,7 @@ async def main():
   await page.get_by_role('textbox',name='论坛话题',exact=True).fill('每日签到新话题')
   await page.get_by_role('button',name='保存到草稿',exact=True).click()
   assert await page.get_by_role('spinbutton',name='反馈窗口上限（秒）').input_value()=='23'
-  await page.get_by_role('button',name='保存所有配置',exact=True).click()
-  await page.wait_for_timeout(100)
+  await click_api(page,page.get_by_role('button',name='保存所有配置',exact=True),'/api/config')
   saved=[p for p in posts if p['path']=='/api/config'][-1]['body']['cfg']
   g=saved['accounts'][0]['groups'][0]
   assert g['topic']=='每日签到新话题' and g['folder']=='签到' and g['primary'] and g['reply_mode']=='after'
@@ -145,15 +149,14 @@ async def main():
   await page.locator('[data-action="edit-group"][data-index="1"]').click()
   assert await page.get_by_role('textbox',name='按钮文字 · 一行一级').input_value()=='确认签到\n领取奖励'
   await page.get_by_role('button',name='保存到草稿',exact=True).click()
-  await page.get_by_role('button',name='保存所有配置',exact=True).click()
-  await page.wait_for_timeout(100)
+  await click_api(page,page.get_by_role('button',name='保存所有配置',exact=True),'/api/config')
   assert cfg['accounts'][0]['groups'][1]['click_button']==['确认签到','领取奖励']
   assert cfg['accounts'][0]['groups'][1]['message']==['/checkin','/daily']
   await page.get_by_role('button',name='添加群',exact=True).click()
   await page.get_by_role('button',name='从会话列表选择',exact=True).click()
   await page.get_by_role('button',name='选用',exact=True).first.click()
   await page.get_by_role('button',name='保存到草稿',exact=True).click()
-  await page.get_by_role('button',name='保存所有配置',exact=True).click()
+  await click_api(page,page.get_by_role('button',name='保存所有配置',exact=True),'/api/config')
   await page.wait_for_timeout(100)
   assert cfg['accounts'][0]['groups'][-1]['title']=="O'Reilly <group>"
   await page.get_by_role('spinbutton',name='反馈窗口上限（秒）').fill('77')
@@ -188,7 +191,7 @@ async def main():
   await page.get_by_role('combobox',name='筛选账号',exact=True).select_option('')
   await page.get_by_role('button',name='全部账号待签到',exact=True).click()
   assert await page.get_by_role('checkbox',name='显示签到过程',exact=False).is_checked()
-  await page.get_by_role('button',name='确认发送',exact=True).click()
+  await click_api(page,page.get_by_role('button',name='确认发送',exact=True),'/api/checkin_now')
   assert [p for p in posts if p['path']=='/api/checkin_now'][-1]['body']['show_browser'] is True
   await page.get_by_role('button',name='取消任务',exact=True).first.wait_for()
   await page.get_by_role('button',name='取消任务',exact=True).first.click()
