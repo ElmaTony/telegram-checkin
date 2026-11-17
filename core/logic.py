@@ -1,6 +1,7 @@
 """纯逻辑：签到方式归一 / 结果判定 / 关键词优先级 / 数据提取（可独立单测）。"""
 import random
 import re
+import math
 from functools import lru_cache
 from pathlib import Path
 
@@ -166,6 +167,22 @@ def judge_replies(g, cfg, replies, replied=None):
     return "unconfirmed"
 
 
+def recheck_eligible(result, today=None):
+    """Only persisted sends with an attribution boundary may be inspected read-only."""
+    if today is not None and result.get('date') != today:
+        return False
+    for action in result.get('actions') or []:
+        boundary = action.get('boundary') or {}
+        if not boundary.get('peer'):
+            continue
+        if action.get('sent_mids'):
+            return True
+        cutoff = boundary.get('cutoff')
+        if action.get('sent') is True and isinstance(cutoff, (int, float)) and math.isfinite(cutoff) and cutoff > 0:
+            return True
+    return False
+
+
 def feedback_hint(group, cfg, result):
     """Explain pending results without weakening attribution or configured rules."""
     if result.get('confirm') != 'unconfirmed':
@@ -176,7 +193,9 @@ def feedback_hint(group, cfg, result):
             return {'code':'buttons_pending', 'message':'必需按钮尚未完成。请先核对原消息，避免重复发送口令。'}
     for action in pending:
         if action.get('sent') is not False and not action.get('sent_mids'):
-            return {'code':'missing_message_id', 'message':'发送状态待核对，尚未登记消息 ID。请先在 Telegram 检查，避免重复发送。'}
+            message = ('尚未登记消息 ID，可先只读补查历史反馈；不会重新发送签到内容。'
+                       if recheck_eligible(result) else '发送状态待核对，尚未登记消息 ID。请先在 Telegram 检查，避免重复发送。')
+            return {'code':'missing_message_id', 'message':message}
     for action in pending:
         trusted = action.get('trusted_replies') or []
         if action.get('error') or not action.get('sent') or not action.get('boundary', {}).get('peer') or not trusted:

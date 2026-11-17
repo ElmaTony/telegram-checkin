@@ -12,7 +12,7 @@ from . import BASE_DIR
 from .history import append_history
 from .locks import FileLock
 from .logic import (click_steps, delay_range, group_actions, infer_method,
-                    judge_replies, merge_action_results, pick, pick_result_reply, status_of)
+                    judge_replies, merge_action_results, pick, pick_result_reply, status_of, recheck_eligible)
 from .state import load_state, prune_state, record_last, record_title
 from .storage import atomic_write
 from .timeutil import now as local_now, set_timezone, reset_timezone
@@ -194,9 +194,11 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
             engine.before_send = before_dispatch
             if method in ('image_text', 'image_only'):
                 action['with_image'] = True
-                await engine.send_image(pick(configured.get('image')), pick(configured.get('message')) if method == 'image_text' else None)
+                action['sent_text'] = pick(configured.get('message')) if method == 'image_text' else None
+                await engine.send_image(pick(configured.get('image')), action['sent_text'])
             else:
-                await engine.send_text(pick(configured.get('message', '签到')))
+                action['sent_text'] = pick(configured.get('message', '签到'))
+                await engine.send_text(action['sent_text'])
             action['sent'] = True
             engine._next_send_at = (getattr(engine, 'send_started_monotonic', None) or time.monotonic()) + random.uniform(lo, hi)
             group_sent_at = group_sent_at or getattr(engine, 'send_started_at', None)
@@ -245,9 +247,12 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
                 # Keep the observer alive even when a bot deleted the outgoing bubble too soon.
                 try:
                     action['replies'] = await _watch_feedback(engine, boundary, group, cfg, sent_mids=action['sent_mids'], started_at=getattr(engine, 'send_started_monotonic', None))
+                    action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
                     action['trusted_replies'] = list(engine.last_replied)
                     action['evidence'] = list(engine.last_evidence)
                     action['confirm'] = _judge_action(group, cfg, action)
+                    if action['confirm'] == 'success':
+                        action.pop('warning', None)
                 except asyncio.CancelledError:
                     action.update(error='用户取消反馈核对；发送状态待核对', confirm='unconfirmed')
                     actions.append(action)
@@ -278,14 +283,33 @@ async def _recheck(engine, group, result, cfg):
         if action.get('buttons_complete') is False and action.get('confirm') == 'success':
             action['confirm'] = 'unconfirmed'
         reviewable_failure = action.get('confirm') == 'failed' and action.get('ok') and not action.get('error')
-        if (action.get('confirm') != 'unconfirmed' and not reviewable_failure) or not action.get('sent') or not action.get('sent_mids'):
+        if (action.get('confirm') != 'unconfirmed' and not reviewable_failure) or not action.get('sent'):
+            continue
+        history = await engine.collect_feedback_history(action['boundary'])
+        ids = set(action.get('sent_mids') or [])
+        for old, new in history.get('aliases', []):
+            if str(old) in ids:
+                ids.add(str(new))
+        action['sent_mids'] = sorted(ids)
+        if not action.get('sent_mids'):
+            text = action.get('sent_text')
+            if text is None and index < len(configured):
+                candidate = configured[index].get('message')
+                text = candidate if isinstance(candidate, str) else None
+            recovered = await engine.recover_sent_mids(action['boundary'], text)
+            action['sent_mids'] = recovered['sent_mids']
+            if recovered['sent_mids']:
+                action['id_recovery'] = recovered
+        if not action.get('sent_mids'):
             continue
         engine.last_sent_mids.update(action['sent_mids'])
         replies = await _watch_feedback(engine, action['boundary'], group, cfg, sent_mids=action['sent_mids'])
         action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
-        action['replies'].extend(replies)
-        action['trusted_replies'].extend(engine.last_replied)
-        action['evidence'].extend(engine.last_evidence)
+        action['replies'] = list(dict.fromkeys([*action.get('replies', []), *replies]))
+        action['trusted_replies'] = list(dict.fromkeys([*action.get('trusted_replies', []), *engine.last_replied]))
+        evidence = {(item.get('mid'), item.get('t')):item for item in action.get('evidence', [])}
+        evidence.update({(item.get('mid'), item.get('t')):item for item in engine.last_evidence})
+        action['evidence'] = list(evidence.values())
         action['confirm'] = _judge_action(group, cfg, action)
         if action.get('ok') and action['confirm'] != 'unconfirmed':
             action['error'] = None
@@ -309,8 +333,8 @@ async def _web_account_worker(account, cfg, state, today, lo, hi, wait_seconds, 
         if recheck:
             for group in selected:
                 previous = state.get('_last', {}).get(name, {}).get(str(group['chat']), {})
-                if previous.get('date') != today or not previous.get('actions') or not any(a.get('sent_mids') for a in previous['actions']):
-                    raise ValueError('旧结果缺少关联消息 ID，无法安全补查；请先在 Telegram 核对')
+                if not recheck_eligible(previous, today):
+                    raise ValueError('旧结果缺少可靠发送边界，无法安全补查；请先在 Telegram 核对')
                 _progress(name, '仅补查反馈', group)
                 try:
                     result = await _recheck(engine, group, {'actions': previous['actions']}, cfg)

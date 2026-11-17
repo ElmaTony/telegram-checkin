@@ -262,6 +262,15 @@ class IsolatedFiles(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertFalse(gui.BOT['busy'])
 
+    def test_missing_id_send_with_reliable_boundary_can_be_inspected_readonly(self):
+        saved={'date':f'{datetime.now():%Y-%m-%d}','confirm':'unconfirmed','actions':[{
+            'sent':True,'sent_mids':[],'boundary':{'peer':'-101','cutoff':time.time()}}]}
+        state.save_state({'_last':{'Audit':{'-101':saved}}})
+        self.assertTrue(self.client.get('/api/status').json['accounts'][0]['groups'][0]['can_recheck'])
+        response=self.client.post('/api/recheck',json={'account':'Audit','chats':['-101']})
+        self.assertEqual(response.status_code,202)
+        self.assertEqual(gui.TRIGGER['mode'],'recheck')
+
     def test_legacy_success_is_labelled_without_fabricating_evidence(self):
         state.save_state({'_last': {'Audit': {'-101': {'date': f'{datetime.now():%Y-%m-%d}', 'confirm': 'success', 'detail': 'old text'}}}})
         group = self.client.get('/api/status').json['accounts'][0]['groups'][0]
@@ -431,6 +440,8 @@ class FakeEngine:
         if self.fail_open: raise RuntimeError('Wrong destination; not sent')
     async def assert_destination(self): return '-101'
     async def _scroll_chat_bottom(self): pass
+    async def collect_feedback_history(self, *_):return {'items':[],'aliases':[]}
+    async def recover_sent_mids(self, *_):return {'sent_mids':[],'evidence':[]}
     async def opened_chat_info(self): return {'pid':'-101','title':'Verified title'}
     async def snapshot_incoming(self, *_): return {'seen': set(), 'cutoff': time.time(), 'peer':'-101'}
     async def send_text(self, *_):
@@ -629,6 +640,28 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['confirm'],'failed')
         self.assertEqual(engine.watch_count,0)
         self.assertEqual(engine.sent_count,0)
+
+    async def test_readonly_recheck_recovers_missing_id_without_sending(self):
+        previous={'actions':[{'ok':True,'confirm':'unconfirmed','sent':True,'sent_mids':[],'error':None,'clicked':False,'with_image':False,
+            'replies':[],'trusted_replies':[],'evidence':[],
+            'boundary':{'peer':'-101','cutoff':time.time()}}]}
+        before=copy.deepcopy(previous);engine=FakeEngine({'name':'Audit'}, {})
+        with patch.object(engine,'recover_sent_mids',AsyncMock(return_value={'sent_mids':['501'],'evidence':[],'source':'account_mention_reply'})):
+            result=await runner._recheck(engine,{'chat':'-101','message':'签到'},previous,{})
+        self.assertEqual(result['confirm'],'success')
+        self.assertEqual(result['actions'][0]['sent_mids'],['501'])
+        self.assertEqual(engine.sent_count,0)
+        self.assertEqual(previous,before)
+
+    async def test_readonly_missing_id_remains_pending_when_recovery_is_ambiguous(self):
+        previous={'actions':[{'ok':True,'confirm':'unconfirmed','sent':True,'sent_mids':[],'error':None,'clicked':False,'with_image':False,
+            'replies':[],'trusted_replies':[],'evidence':[],
+            'boundary':{'peer':'-101','cutoff':time.time()}}]}
+        engine=FakeEngine({'name':'Audit'}, {})
+        result=await runner._recheck(engine,{'chat':'-101'},previous,{})
+        self.assertEqual(result['confirm'],'unconfirmed')
+        self.assertEqual(engine.sent_count,0)
+        self.assertEqual(engine.watch_count,0)
 
     async def test_feedback_completion_uses_group_keywords_and_trusted_pool(self):
         engine=FakeEngine({'name':'Audit'}, {})

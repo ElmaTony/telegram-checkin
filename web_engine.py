@@ -122,6 +122,7 @@ class WebEngine:
         self._active_mids = None
         self._profile_lock = None
         self._login_verified = False
+        self._self_peer = None
 
     # ---------- 基础 ----------
 
@@ -1161,14 +1162,16 @@ class WebEngine:
             if (capture) capture.observer.disconnect();
             capture = {peer:options.peer, records:new Map(), ids:new WeakMap(), aliases:[], observer:null};
             capture.read = b => {
-                    if (!b.matches?.('.bubble[data-mid]') || b.getAttribute('data-peer-id') !== options.peer) return;
+                    if (!b?.matches?.('.bubble[data-mid]') || b.getAttribute('data-peer-id') !== options.peer) return;
                     const mid=b.getAttribute('data-mid'), previous=capture.ids.get(b);
                     if(previous && previous!==mid) capture.aliases.push([previous,mid]);
                     capture.ids.set(b,mid);
                     const message=b.querySelector('.message');
-                    const t=(message?message.textContent:b.textContent||'').trim().replace(/(\s*\d{1,2}:\d{2}){1,2}\s*$/, '');
+                    const body=message?.querySelector('[data-message-text-source]')||message;
+                    const t=(body?body.textContent:b.textContent||'').trim().replace(/(\s*\d{1,2}:\d{2}){1,2}\s*$/, '');
+                    const mentions=[...new Set([...body?.querySelectorAll('[data-follow]')||[]].map(e=>e.getAttribute('data-follow')).filter(id=>/^\d+$/.test(id)))];
                     const record={mid,t,rm:b.getAttribute('data-reply-to-mid'),ts:Number(b.getAttribute('data-timestamp')||0),
-                                  peer:options.peer,out:b.classList.contains('is-out'),pending:b.classList.contains('is-sending')||mid.includes('.')};
+                                  peer:options.peer,mentions,out:b.classList.contains('is-out'),pending:b.classList.contains('is-sending')||mid.includes('.')};
                     capture.records.set(mid,record);
                     if(capture.records.size>1000)capture.records.delete(capture.records.keys().next().value);
             };
@@ -1182,6 +1185,7 @@ class WebEngine:
                         node.querySelectorAll('.bubble[data-mid]').forEach(capture.read);
                     }
                 }
+                for(const mutation of mutations)if(mutation.target.nodeType===1)capture.read(mutation.target.closest('.bubble[data-mid]'));
                 capture.scan();
             });
             capture.observer.observe(document.body,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['data-mid','data-reply-to-mid','data-peer-id','data-timestamp','class']});
@@ -1190,6 +1194,86 @@ class WebEngine:
         capture.scan();
         return {items:[...capture.records.values()],aliases:capture.aliases.splice(0)};
     }"""
+
+    async def current_user_peer(self):
+        """Read the active account's ID from its account-menu avatar, never storage."""
+        if self._self_peer:
+            return self._self_peer
+        toggle = self.page.locator('.sidebar-tools-button')
+        if not await toggle.count():
+            return None
+        opened = False
+        try:
+            if await toggle.get_attribute('aria-expanded') != 'true':
+                await toggle.click(timeout=1200)
+                opened = True
+            avatar = self.page.locator('[role="menu"]:visible .avatar.active[data-peer-id]')
+            await avatar.first.wait_for(state='visible', timeout=1200)
+            peers = await avatar.evaluate_all('(items)=>[...new Set(items.map(e=>e.dataset.peerId))]')
+            if len(peers) == 1 and str(peers[0]).isdigit():
+                self._self_peer = str(peers[0])
+        except Exception:
+            return None
+        finally:
+            if opened:
+                await self.page.keyboard.press('Escape')
+        return self._self_peer
+
+    async def collect_feedback_history(self, known, seconds=8):
+        """Load the original send window by scrolling history; never edit or send."""
+        if not isinstance(known, dict) or not known.get('peer') or not known.get('cutoff'):
+            return {'items': [], 'aliases': []}
+        await self.assert_destination()
+        deadline, aliases = time.monotonic() + seconds, []
+        data = {'items': []}
+        while True:
+            data = await self.page.evaluate(self._IN_COLLECT_JS, {'peer':known['peer'], 'reset':False})
+            aliases.extend(data.get('aliases', []))
+            stamps = [r['ts'] for r in data['items'] if r.get('ts')]
+            if stamps and min(stamps) < known['cutoff'] - 2 or time.monotonic() >= deadline:
+                break
+            previous = await self.page.evaluate('''peer => [...document.querySelectorAll('.bubbles .bubble[data-mid]')].filter(b=>b.dataset.peerId===peer).map(b=>b.dataset.mid).join(',')''', known['peer'])
+            moved = await self.page.evaluate('''() => {
+                const scroller=[...document.querySelectorAll('.bubbles .bubbles-scrollable')].find(e=>e.checkVisibility());
+                if(!scroller)return false;
+                scroller.scrollTop=0;scroller.dispatchEvent(new Event('scroll'));return true;
+            }''')
+            if not moved:
+                break
+            try:
+                await self.page.wait_for_function('''({peer,previous}) => [...document.querySelectorAll('.bubbles .bubble[data-mid]')].filter(b=>b.dataset.peerId===peer).map(b=>b.dataset.mid).join(',')!==previous''',
+                    arg={'peer':known['peer'], 'previous':previous}, timeout=max(1,min(700,int((deadline-time.monotonic())*1000))))
+            except Exception:
+                if self.page.is_closed():
+                    raise
+        return {**data, 'aliases':aliases}
+
+    async def recover_sent_mids(self, known, sent_text=None):
+        """Recover only a unique own message or a reply explicitly naming this account."""
+        empty = {'sent_mids': [], 'evidence': []}
+        if not isinstance(known, dict) or not known.get('peer') or not isinstance(known.get('cutoff'), (int,float)):
+            return empty
+        await self.assert_destination()
+        data = await self.page.evaluate(self._IN_COLLECT_JS, {'peer':known['peer'], 'reset':False})
+        seen = {str(mid) for mid in known.get('seen', [])}
+        window = [r for r in data['items'] if not r.get('pending') and (str(r['mid']) not in seen or str(r['mid']) in known.get('versions', {}))
+                  and int(known['cutoff']) <= r.get('ts',0) <= known['cutoff'] + 30]
+        outgoing = [r for r in window if r.get('out') and sent_text is not None and r['t'] == str(sent_text).strip()]
+        if len(outgoing) == 1:
+            return {'sent_mids':[str(outgoing[0]['mid'])], 'evidence':outgoing, 'source':'own_outgoing_history'}
+        if len(outgoing) > 1:
+            return empty
+        replies = [r for r in window if not r.get('out') and r.get('rm') and str(r['rm']) not in seen
+                   and len(r.get('mentions', [])) == 1]
+        if not replies:
+            return empty
+        own = await self.current_user_peer()
+        await self.assert_destination()
+        replies = [r for r in replies if r['mentions'] == [own]] if own else []
+        ids = {str(r['rm']) for r in replies}
+        if len(ids) != 1:
+            return empty
+        return {'sent_mids':sorted(ids), 'evidence':replies, 'source':'account_mention_reply', 'account_peer':own}
 
     async def snapshot_incoming(self, mode="after"):
         self.send_started_at = None
@@ -1209,6 +1293,7 @@ class WebEngine:
         seen = set(known.get("seen", []))
         known["seen"] = sorted(seen)
         known.setdefault("versions", {})
+        relations = known.setdefault('relations', {})
         self._capture_by_chat[self._mids_chat] = known
         deadline = (started_at if started_at is not None else time.monotonic()) + max(0, seconds)
         found, replied, evidence = [], [], []
@@ -1228,21 +1313,27 @@ class WebEngine:
                     self.last_sent_mids.add(str(new))
                 if str(old) in allowed:
                     allowed.add(str(new))
+            if not allowed and known.get('sent_at'):
+                recovered = await self.recover_sent_mids(known, self._automation_text)
+                allowed.update(recovered['sent_mids'])
+                self.last_sent_mids.update(allowed)
             for record in data.get("items", []):
                 mid = str(record["mid"])
                 if record.get("out") or not record.get("t"):
                     continue
                 if record.get("ts", 0) < int(known["cutoff"]):
                     continue
-                if mid in seen and (mid not in known["versions"] or known["versions"][mid] == record["t"]):
-                    continue
                 exact = str(record.get("rm")) in allowed
                 private = str(known["peer"]).isdigit()
+                relation = 'reply:' + str(record.get('rm')) if exact else 'private' if private else 'unrelated'
+                if mid in seen and (mid not in known['versions'] or known['versions'][mid] == record['t'] and relations.get(mid, 'unrelated') == relation):
+                    continue
                 if not exact and not private and mode == "reply_only":
                     continue
                 seen.add(mid)
                 known["seen"] = sorted(seen)
                 known["versions"][mid] = record["t"]
+                relations[mid] = relation
                 found.append(record["t"])
                 record = {**record, "source": "reply_to_sent" if exact else "private_chat" if private else "unrelated"}
                 evidence.append(record)

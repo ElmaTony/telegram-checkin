@@ -27,7 +27,7 @@ from core.config import CONFIG_PATH, load_config, safe_name, save_config, valida
 from core.history import HISTORY_DIR
 from core.locks import FileLock
 from core.log import LOG_PATH, setup_logging
-from core.logic import (group_actions, infer_method, judge_replies, feedback_hint, _kw_hit,
+from core.logic import (group_actions, infer_method, judge_replies, feedback_hint, recheck_eligible, _kw_hit,
                         DEFAULT_SUCCESS_KW, DEFAULT_FAIL_KW)
 from core.runner import ACTIVITY, PROBE, run_probe_round, run_web_round
 from core.state import load_state, save_state
@@ -260,7 +260,7 @@ def api_status():
                            'topic_id': group.get('topic_id'), 'is_forum': bool(group.get('is_forum') or group.get('topic') or chat in forum_ids),
                            'source': latest.get('source') or ('legacy' if latest or done else 'unknown'),
                            'done': done, 'confirm': latest.get('confirm') or ('success' if done else None),
-                           'can_recheck': bool(latest.get('actions') and any(a.get('sent_mids') for a in latest['actions']))})
+                           'can_recheck': recheck_eligible(latest, today)})
         accounts.append({'name': account['name'], 'status': '上次已登录' if WebEngine(account, cfg).marker().exists() else '待扫码',
                          'done': sum(g['confirm'] == 'success' for g in groups), 'total': len(groups), 'groups': groups})
     return jsonify(accounts=accounts, today=today, busy=BOT['busy'], activity=ACTIVITY['act'],
@@ -439,8 +439,8 @@ def _queue(mode):
         raise ValueError('补查必须指定账号与会话')
     if mode == 'recheck':
         latest = load_state().get('_last', {}).get(account, {})
-        if any(latest.get(chat, {}).get('date') != f'{local_now(read_cfg()):%Y-%m-%d}' or not latest.get(chat, {}).get('actions') or not any(a.get('sent_mids') and a.get('boundary', {}).get('peer') for a in latest[chat]['actions']) for chat in chats):
-            raise ValueError('只能补查今天且保留关联消息 ID 的结果；旧记录请先在 Telegram 核对')
+        if any(not recheck_eligible(latest.get(chat, {}), f'{local_now(read_cfg()):%Y-%m-%d}') for chat in chats):
+            raise ValueError('只能补查今天且保留发送消息 ID 或可靠发送边界的结果；旧记录请先在 Telegram 核对')
     with _lock:
         job_id = _reserve(mode, show_browser=show_browser)
         TRIGGER.update(only=account, chats=chats, mode=mode, scheduled_accounts=[])

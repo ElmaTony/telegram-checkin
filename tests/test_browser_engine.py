@@ -134,6 +134,91 @@ class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
         found=await self.engine.watch_new_incoming(boundary,1.5,'after',idle_after=.05)
         self.assertEqual(judge_replies({}, {},found,self.engine.last_replied),'unconfirmed')
 
+    async def test_reactions_and_delivery_status_are_not_part_of_message_text(self):
+        await self.bubble('502','',reply='501')
+        await self.page.locator('[data-mid="502"] .message').evaluate('''el=>el.innerHTML='<div data-message-text-source>签到成功</div><reactions-element>other user</reactions-element><span class="time">19:2219:22</span>' ''')
+        data=await self.page.evaluate(self.engine._IN_COLLECT_JS,{'peer':'-101','reset':True})
+        self.assertEqual(data['items'][0]['t'],'签到成功')
+
+    async def test_same_text_is_promoted_when_reply_attribution_arrives_late(self):
+        boundary=await self.engine.snapshot_incoming()
+        await self.bubble('502','签到成功')
+        await self.engine.watch_new_incoming(boundary,.1,'after',sent_mids=['501'])
+        self.assertEqual(self.engine.last_replied,[])
+        await self.page.locator('[data-mid="502"]').evaluate("el=>el.dataset.replyToMid='501'")
+        await self.engine.watch_new_incoming(boundary,.3,'after',sent_mids=['501'],idle_after=.02)
+        self.assertEqual(self.engine.last_replied,['签到成功'])
+        self.assertEqual(self.engine.last_evidence[0]['source'],'reply_to_sent')
+
+    async def test_readonly_history_loads_original_window_without_touching_draft(self):
+        await self.page.locator('[contenteditable]').fill('keep this draft')
+        cutoff=time.time()-600
+        await self.bubble('900','latest unrelated')
+        await self.page.evaluate('''cutoff=>{
+            const sc=document.createElement('div');sc.className='bubbles-scrollable';sc.style='height:80px;overflow:auto';
+            const space=document.createElement('div');space.style.height='500px';sc.append(space);
+            document.querySelector('.bubbles').append(sc);
+            sc.addEventListener('scroll',()=>{
+                if(window.loadedHistory)return;window.loadedHistory=true;
+                const b=document.createElement('div');b.className='bubble is-in';
+                Object.assign(b.dataset,{mid:'499',peerId:'-101',timestamp:String(Math.floor(cutoff-10))});
+                b.innerHTML='<div class="message">older history</div>';document.querySelector('.bubbles').append(b);
+            });
+        }''',cutoff)
+        data=await self.engine.collect_feedback_history({'peer':'-101','cutoff':cutoff},seconds=1)
+        self.assertIn('499',[item['mid'] for item in data['items']])
+        self.assertEqual(await self.page.locator('[contenteditable]').inner_text(),'keep this draft')
+
+    async def test_readonly_recovery_requires_unique_own_outgoing_text(self):
+        known={'peer':'-101','cutoff':time.time()-2,'seen':['100']}
+        await self.bubble('100','签到',out=True)
+        await self.bubble('501','签到',out=True)
+        recovery=await self.engine.recover_sent_mids(known,'签到')
+        self.assertEqual(recovery['sent_mids'],['501'])
+        await self.bubble('503','签到',out=True)
+        self.assertEqual((await self.engine.recover_sent_mids(known,'签到'))['sent_mids'],[])
+
+    async def test_recovery_rejects_other_accounts_old_replies_and_ambiguous_ids(self):
+        self.engine._self_peer='777'
+        cutoff=time.time()-5
+        for mentions,reply,age,second in [('888','501',0,False),('777','100',0,False),('777','501',100,False),('777','501',0,True)]:
+            with self.subTest(mentions=mentions,reply=reply,age=age,second=second):
+                await self.page.locator('.bubbles').evaluate('el=>el.innerHTML=""')
+                await self.page.evaluate(self.engine._IN_COLLECT_JS,{'peer':'-101','reset':True})
+                await self.bubble('502','',reply=reply,age=age)
+                await self.page.locator('[data-mid="502"] .message').evaluate('(el,peer)=>el.innerHTML=`<div data-message-text-source><a data-follow="${peer}">Fixture</a> 签到成功</div>`',mentions)
+                if second:
+                    await self.bubble('504','',reply='503')
+                    await self.page.locator('[data-mid="504"] .message').evaluate('el=>el.innerHTML=\'<a data-follow="777">Fixture</a> 签到成功\'')
+                result=await self.engine.recover_sent_mids({'peer':'-101','cutoff':cutoff,'seen':['100']},'签到')
+                self.assertEqual(result['sent_mids'],[])
+
+    async def test_deleted_command_can_be_recovered_from_reply_naming_current_account(self):
+        self.engine._self_peer='777'
+        known={'peer':'-101','cutoff':time.time()-2,'sent_at':time.time()-2,'seen':[]}
+        await self.bubble('502','',reply='501')
+        await self.page.locator('[data-mid="502"] .message').evaluate('el=>el.innerHTML=\'<div data-message-text-source><a data-follow="777">Fixture</a> 签到成功</div>\'')
+        recovered=await self.engine.recover_sent_mids(known,'签到')
+        self.assertEqual(recovered['sent_mids'],['501'])
+        self.assertEqual(recovered['source'],'account_mention_reply')
+        await self.engine.watch_new_incoming(known,.2,'after',sent_mids=[],idle_after=.02)
+        self.assertEqual(self.engine.last_replied,['Fixture 签到成功'])
+        self.assertEqual(self.engine.last_allowed_mids,['501'])
+
+    async def test_current_account_is_read_from_active_menu_avatar_and_keeps_draft(self):
+        await self.page.locator('[contenteditable]').fill('original draft')
+        await self.page.evaluate('''()=>{
+            const toggle=document.createElement('button');toggle.className='sidebar-tools-button';toggle.setAttribute('aria-expanded','false');
+            const menu=document.createElement('div');menu.setAttribute('role','menu');menu.hidden=true;
+            menu.innerHTML='<div class="avatar active" data-peer-id="777">Current</div><div class="avatar" data-peer-id="888">Other</div>';
+            toggle.onclick=()=>{menu.hidden=false;toggle.setAttribute('aria-expanded','true')};
+            document.addEventListener('keydown',e=>{if(e.key==='Escape'){menu.hidden=true;toggle.setAttribute('aria-expanded','false')}});
+            document.body.append(toggle,menu);
+        }''')
+        self.assertEqual(await self.engine.current_user_peer(),'777')
+        self.assertEqual(await self.page.locator('[contenteditable]').inner_text(),'original draft')
+        self.assertEqual(await self.page.locator('.sidebar-tools-button').get_attribute('aria-expanded'),'false')
+
     async def test_reply_to_previous_action_does_not_confirm_current_action(self):
         boundary=await self.engine.snapshot_incoming()
         self.engine.last_sent_mids={'501','601'}
