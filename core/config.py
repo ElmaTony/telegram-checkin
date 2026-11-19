@@ -6,9 +6,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from . import BASE_DIR
 from .storage import atomic_write
+from .logic import VALID_METHODS, button_message_ref
 
 CONFIG_PATH = BASE_DIR / "config.yaml"
-VALID_METHODS = ("text", "command", "command_button", "image_text", "image_only")
 _DEVICES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
@@ -149,6 +149,18 @@ def validate_config(cfg):
                     return "口令＋按钮签到必须配置按钮文字"
                 if method in ("command", "command_button") and not action.get("message"):
                     return "口令签到必须配置口令"
+                if method == "button_only":
+                    label = action.get("click_button")
+                    if not isinstance(label, str) or not label.strip() or len(label.splitlines()) != 1:
+                        return "仅按钮签到必须填写一个按钮的完整文字"
+                    reference = action.get("button_message")
+                    if reference:
+                        try:
+                            button_message_ref(reference)
+                        except ValueError as error:
+                            return str(error)
+                    elif str(group.get("chat", "")).lstrip("#").startswith("-"):
+                        return "群聊的仅按钮签到需要指定消息链接或数字消息 ID"
     return None
 
 

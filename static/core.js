@@ -5,8 +5,8 @@ export const words = value => value.split('\n').map(s => s.trim()).filter(Boolea
 export const normalizeValue = value => { const result=words(value); return result.length===1?result[0]:result; };
 export const range = (value, fallback=[1,3]) => typeof value==='number'?[value,value]:Array.isArray(value)&&value.length===2?value:fallback;
 export const formatTime = (value,zone='Asia/Hong_Kong') => {if(!value)return '';try{return new Date(value).toLocaleString('zh-CN',{timeZone:zone,hour12:false});}catch{return String(value);}};
-export const methods = {text:'文字签到',command:'口令签到',command_button:'口令＋按钮',image_text:'图片＋文字',image_only:'仅图片'};
-export const sourceLabels = {shared:'共用系统代签',reply_to_sent:'明确回复本次消息',private_chat:'本次发送后的私聊反馈',unknown:'尚无可信归属证据',legacy:'旧版记录 · 未留存归属证据'};
+export const methods = {text:'文字签到',command:'口令签到',command_button:'口令＋按钮',button_only:'仅按钮',image_text:'图片＋文字',image_only:'仅图片'};
+export const sourceLabels = {button_popup:'机器人按钮反馈弹窗',shared:'共用系统代签',reply_to_sent:'明确回复本次消息',private_chat:'本次发送后的私聊反馈',unknown:'尚无可信归属证据',legacy:'旧版记录 · 未留存归属证据'};
 export const stageLabels = {completed:'已完成',failed:'已终止',awaiting_confirmation:'等待确认',recheck_failed:'补查未完成'};
 export const pages = {overview:['签到工作台','layout'],accounts:['账号与规则','users'],automation:['定时与通知','settings'],history:['执行记录','history'],stats:['统计','chart'],logs:['运行日志','terminal']};
 const paths = {close:'M6 6l12 12M18 6L6 18',layout:'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z', users:'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M16 3a4 4 0 0 1 0 8 M22 21v-2a4 4 0 0 0-3-3.87 M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0',history:'M3 12a9 9 0 1 0 3-6.7 M3 3v6h6 M12 7v5l3 2',chart:'M4 20V10 M10 20V4 M16 20v-7 M22 20H2',terminal:'m5 7 5 5-5 5 M13 17h6',play:'m8 4 12 8-12 8z',shield:'m12 3 8 4v6c0 5-8 8-8 8s-8-3-8-8V7z m-4 9 3 3 5-6',search:'M21 21l-5-5 M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',settings:'M4 7h10 M18 7h2 M4 12h4 M12 12h8 M4 17h9 M17 17h3',refresh:'M20 7a9 9 0 1 0 1 7 M20 3v5h-5',stop:'M6 6h12v12H6z',plus:'M12 5v14 M5 12h14',arrow:'m9 5 7 7-7 7',download:'M12 3v12 m-5-5 5 5 5-5 M5 17v4h14v-4',check:'m5 12 4 4L19 6'};
@@ -14,7 +14,7 @@ export const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" s
 export const button = (action,label,{primary=false,iconName='',extra='',disabled=false,kind=''}={}) => `<button type="button" data-action="${action}" class="${primary?'primary ':''}${kind}" ${disabled?'disabled':''} ${extra}>${iconName?icon(iconName):''}${label}</button>`;
 export const keyOf = row => JSON.stringify([row.account,row.chat]);
 export const flatten = status => (status?.accounts||[]).flatMap(a=>(a.groups||[]).map(g=>({...g,account:a.name,login:a.status})));
-export const actionsOf = group => copy(group.actions?.length?group.actions:[{method:group.method||(group.image?(group.message?'image_text':'image_only'):group.click_button?'command_button':'text'),message:group.message??'签到',image:group.image||'',click_button:group.click_button||''}]);
+export const actionsOf = group => copy(group.actions?.length?group.actions:[{method:group.method||(group.image?(group.message?'image_text':'image_only'):group.click_button?'command_button':'text'),message:group.message??'签到',image:group.image||'',click_button:group.click_button||'',button_message:group.button_message||''}]);
 export const conversationLabels = {group:'群组/频道',forum:'论坛话题',private:'私聊/机器人',unknown:'类型待识别'};
 export function conversationKind(row){
  const peer=String(row.chat).startsWith('@')&&row.sent===true&&row.source!=='shared'?String(row.expected_peer||row.chat):String(row.chat);
@@ -36,7 +36,7 @@ export function configuredRows(status,cfg){
 }
 export const matchesSearch = (row,query) => !query.trim() || [row.name,row.chat,row.account,row.topic,row.share_group,...actionMethods(row).map(method=>methods[method])].filter(Boolean).join(' ').toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
 export function methodLabel(group){
- const names={text:'文字',command:'口令',command_button:'口令＋按钮',image_text:'图文',image_only:'图片'};
+ const names={text:'文字',command:'口令',command_button:'口令＋按钮',button_only:'仅按钮',image_text:'图文',image_only:'图片'};
  return isMultiStep(group)?`${actionMethods(group).map(method=>names[method]).join(' / ')} · ${group.action_count||group.methods?.length||group.actions?.length} 步`:methods[group.method]||'文字签到';
 }
 export const sendUncertain = row => (row.actions||[]).some(action=>action.sent&&(action.warning&&!action.sent_mids?.length||action.sent_mids?.length&&action.sent_mids.every(mid=>String(mid).includes('.'))));

@@ -135,6 +135,49 @@ class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
             const pane=document.querySelector('.bubbles-inner')||document.querySelector('.bubbles');pane.classList.remove('no-messages');pane.append(b);
         }''',{'mid':mid,'text':text,'reply':reply,'age':age,'out':out})
 
+    async def test_button_only_clicks_newest_exact_button_and_reads_popup(self):
+        self.engine._expected_peer = self.engine._mids_chat = '701'
+        await self.page.set_content('''
+          <div class="chat-info"><span class="peer-title" data-peer-id="701">Example</span></div>
+          <div contenteditable="true" class="input-message-input" data-peer-id="701"></div>
+          <div class="bubbles">
+            <div class="bubble is-in" data-peer-id="701" data-mid="1"><button class="reply-markup-button" id="old">✅ 点我签到</button></div>
+            <div class="bubble is-in" data-peer-id="701" data-mid="2">
+              <button class="reply-markup-button" id="latest"><span class="reply-markup-button-text"><img alt="✅"> 点我签到</span></button>
+              <button class="reply-markup-button" id="disable">关闭提醒</button>
+            </div>
+          </div>
+          <script>
+            const rows=[...document.querySelectorAll('.bubble')];
+            const now=Math.floor(Date.now()/1000);
+            rows[0].dataset.timestamp=now-10;
+            rows[1].dataset.timestamp=now;
+            window.clicked=[];
+            document.querySelector('#old').onclick=()=>window.clicked.push('old');
+            document.querySelector('#disable').onclick=()=>window.clicked.push('disable');
+            document.querySelector('#latest').onclick=()=>{
+              window.clicked.push('latest');
+              setTimeout(()=>{
+                const popup=document.createElement('div');
+                popup.className='popup popup-confirmation';
+                popup.innerHTML='<p class="popup-description">签到成功，获得 8 积分</p><div class="popup-buttons"><button>确定</button></div>';
+                popup.querySelector('button').onclick=()=>popup.remove();
+                document.body.append(popup);
+              },80);
+            };
+          </script>
+        ''')
+        self.engine.before_send = AsyncMock()
+        self.assertEqual(await self.engine.click_existing_button('✅ 点我签到', None, time.time()-3600), '2')
+        self.engine.before_send.assert_awaited_once()
+        self.assertEqual(await self.engine.read_button_popup(1.5), '签到成功，获得 8 积分')
+        self.assertEqual(await self.page.evaluate('window.clicked'), ['latest'])
+        self.assertEqual(await self.page.locator('.popup-confirmation').count(), 0)
+
+    async def test_button_only_rejects_link_to_a_different_peer(self):
+        with self.assertRaisesRegex(ValueError, '会话不符'):
+            await self.engine.click_existing_button('Confirm', 'https://t.me/c/123/17', 0)
+
     async def test_hash_does_not_override_visible_peer_and_send_is_blocked(self):
         await self.page.evaluate("location.hash='-999'")
         self.assertFalse(await self.engine._wait_opened('-999',timeout=.02))

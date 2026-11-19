@@ -521,6 +521,31 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observed[0]['actions'][0]['sent_mids'],['1'])
         self.assertEqual(observed[0]['confirm'],'unconfirmed')
 
+    async def test_button_only_uses_popup_as_feedback_without_sending_a_message(self):
+        value={};engine=FakeEngine({'name':'Audit'}, {})
+        group={'chat':'701','method':'button_only','click_button':'示例签到'}
+
+        async def click(*args):
+            self.assertIsNotNone(engine.before_send)
+            await engine.before_send()
+            self.assertIsNone(value['_last']['Audit']['701']['sent'])
+            return '30'
+
+        async def popup(seconds):
+            self.assertTrue(value['_last']['Audit']['701']['sent'])
+            return '签到成功，获得 8 积分'
+
+        engine.click_existing_button=click
+        engine.read_button_popup=popup
+        _,actions,_,_=await runner._send_group_actions(engine,value,'Audit',group,{},0,0)
+        result=runner._result(group,actions,engine)
+        self.assertEqual(engine.sent_count,0)
+        self.assertEqual(result['confirm'],'success')
+        self.assertTrue(result['clicked'])
+        self.assertEqual(result['source'],'button_popup')
+        self.assertEqual(result['evidence'][0]['mid'],'30')
+        self.assertEqual(result['replies'],['签到成功，获得 8 积分'])
+
     async def test_final_result_and_processed_date_are_saved_together_once(self):
         value={};saved=[]
         result={'chat':'-101','name':'Fixture','ok':True,'confirm':'success','sent':True,'error':None,'replies':['签到成功']}

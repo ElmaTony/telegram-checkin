@@ -7,7 +7,11 @@ from pathlib import Path
 
 from . import BASE_DIR
 
-VALID_METHODS = ("text", "command", "command_button", "image_text", "image_only")
+VALID_METHODS = ("text", "command", "command_button", "button_only", "image_text", "image_only")
+_BUTTON_MESSAGE = re.compile(
+    r"(?:https://)?t\.me/(?:(?:c/(?P<chat>[1-9]\d*))|(?P<username>[A-Za-z][A-Za-z0-9_]{2,}))"
+    r"/(?P<first>[1-9]\d*)(?:/(?P<second>[1-9]\d*))?(?:\?thread=(?P<thread>[1-9]\d*))?"
+)
 DEFAULT_SUCCESS_KW = ["签到成功", "打卡成功", "签到完成", "已签到", "成功"]
 DEFAULT_FAIL_KW = ["签到失败", "打卡失败", "失败", "禁言", "被禁", "封禁", "错误", "无法", "异常"]
 _GENERIC_RESULT_WORDS = {"成功", "失败", "禁言", "被禁", "封禁", "错误", "无法", "异常"}
@@ -59,6 +63,23 @@ def infer_method(g):
     return "command_button" if pick(g.get("click_button")) else "text"
 
 
+def button_message_ref(value):
+    """Parse a numeric ID or the peer, thread and message from a Telegram link."""
+    if not isinstance(value, str):
+        raise ValueError("请输入 Telegram 消息链接或数字消息 ID")
+    value = value.strip()
+    if re.fullmatch(r"[1-9]\d*", value):
+        return value, None, None
+    match = _BUTTON_MESSAGE.fullmatch(value)
+    if not match:
+        raise ValueError("请输入 Telegram 消息链接或数字消息 ID")
+    fields = match.groupdict()
+    peer = '-' + fields['chat'] if fields['chat'] else '@' + fields['username'].lower()
+    if fields['second'] and fields['thread'] and fields['first'] != fields['thread']:
+        raise ValueError("消息链接中的话题 ID 不一致")
+    return fields['second'] or fields['first'], peer, fields['first'] if fields['second'] else fields['thread']
+
+
 def group_actions(g):
     """把群配置归一成动作列表：actions（多步签到）优先，老单方式配置转成单动作。"""
     acts = g.get("actions")
@@ -66,7 +87,7 @@ def group_actions(g):
         result = [dict(a) for a in acts if isinstance(a, dict)]
         if result:
             return result
-    flat = {k: g[k] for k in ("method", "message", "image", "click_button") if k in g}
+    flat = {k: g[k] for k in ("method", "message", "image", "click_button", "button_message") if k in g}
     return [flat]
 
 
@@ -172,6 +193,8 @@ def recheck_eligible(result, today=None):
     if today is not None and result.get('date') != today:
         return False
     for action in result.get('actions') or []:
+        if action.get('button_only'):
+            continue
         boundary = action.get('boundary') or {}
         if not boundary.get('peer'):
             continue
@@ -188,6 +211,9 @@ def feedback_hint(group, cfg, result):
     if result.get('confirm') != 'unconfirmed':
         return None
     pending = [action for action in result.get('actions') or [] if action.get('confirm') == 'unconfirmed']
+    for action in pending:
+        if action.get('button_only'):
+            return {'code':'button_feedback', 'message':'请核对点击后出现的机器人弹窗和签到判定词，避免重复点击。'}
     for action in pending:
         if action.get('buttons_complete') is False:
             return {'code':'buttons_pending', 'message':'必需按钮尚未完成。请先核对原消息，避免重复发送口令。'}

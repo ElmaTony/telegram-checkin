@@ -168,8 +168,8 @@ async function loadEditorTopics(refresh=false){
  const editor=state.editor;if(!editor)return;
  const account=state.draft.accounts[state.accountIndex],name=state.origins.get(account);
  const chat=String(editor.group.chat||'').trim().replace(/^#/,'');
- if(!name||name!==account.name)throw new Error('请先保存账号名称，再读取会话话题');
- if(!/^-?\d+$/.test(chat))throw new Error('请从会话列表选择数字 ID，再识别话题');
+ if(!/^-?[1-9]\d*$/.test(chat))throw new Error('请从会话列表选择数字 ID，再识别话题');
+ if(chat.startsWith('-')&&(!name||name!==account.name))throw new Error('请先保存账号名称，再读取会话话题');
  const requestId=Symbol();editor.topicRequest=requestId;editor.topicsLoading=true;editor.topicsError='';editor.topics=null;
  drawEditor();
  try{
@@ -182,6 +182,7 @@ async function loadEditorTopics(refresh=false){
    if(matches.length===1)editor.group.topic_id=matches[0].id;
    else {delete editor.group.topic;delete editor.group.topic_id;}
   }
+  if(refresh)notify(result.is_forum?`已刷新 ${result.topics.length} 个话题`:'已确认此会话没有话题');
  }catch(error){if(state.editor===editor&&editor.topicRequest===requestId)editor.topicsError='识别未完成：'+error.message+'。请重试后选择发送位置。';}
  finally{if(state.editor===editor&&editor.topicRequest===requestId){editor.topicsLoading=false;drawEditor();}}
 }
@@ -199,12 +200,18 @@ async function saveEditor(){
   if(['image_text','image_only'].includes(result.method)&&!String(result.image||'').trim())throw new Error('图片签到必须配置图片路径');
   if(result.method==='command_button'&&!(Array.isArray(result.click_button)?result.click_button.length:String(result.click_button||'').trim()))throw new Error('按钮签到必须配置按钮文字');
   if(['command','command_button'].includes(result.method)&&!lines(result.message).trim())throw new Error('请填写口令');
+  if(result.method==='button_only'){
+   result.click_button=String(result.click_button||'').trim();
+   if(!result.click_button||/[\r\n]/.test(result.click_button))throw new Error('请填写一个按钮的完整文字');
+   result.button_message=String(result.button_message||'').trim();
+   if(g.chat.startsWith('-')&&!result.button_message)throw new Error('群聊的仅按钮签到需要指定消息链接或数字消息 ID');
+  }else delete result.button_message;
   if(!['image_text','image_only'].includes(result.method))delete result.image;
-  if(result.method!=='command_button')delete result.click_button;
-  if(result.method==='image_only')delete result.message;
+  if(!['command_button','button_only'].includes(result.method))delete result.click_button;
+  if(['image_only','button_only'].includes(result.method))delete result.message;
   return result;
  });
- for(const key of ['method','message','image','click_button','actions'])delete g[key];
+ for(const key of ['method','message','image','click_button','button_message','actions'])delete g[key];
  if(normalized.length===1)Object.assign(g,normalized[0]);else g.actions=normalized;
  g.reply_mode??=state.draft.reply_mode||'reply_only';
  if(g.primary){if(!g.share_group)throw new Error('指定主群之前请填写共用系统名称');account.groups.forEach(other=>{if(other.share_group===g.share_group)delete other.primary;});}
@@ -347,7 +354,7 @@ async function onAction(el){
    if(info.is_forum){dialog.is_forum=true;state.chooser.checked.delete(String(dialog.id));drawChooser();throw new Error('「'+dialog.title+'」是论坛群，请单独选择话题后添加。');}
   }
   const existing=new Set(account.groups.map(g=>String(g.chat)));let added=0;
-  for(const id of state.chooser.checked){if(existing.has(id))continue;const dialog=state.chooser.dialogs.find(d=>String(d.id)===id);const g=copy(state.editor.group);g.chat=id;g.title=dialog.title;g.folder=state.chooser.folder||'';g.is_forum=false;g.actions=copy(state.editor.actions);for(const k of ['method','message','image','click_button','primary','topic','topic_id'])delete g[k];account.groups.push(g);existing.add(id);added++;}
+  for(const id of state.chooser.checked){if(existing.has(id))continue;const dialog=state.chooser.dialogs.find(d=>String(d.id)===id);const g=copy(state.editor.group);g.chat=id;g.title=dialog.title;g.folder=state.chooser.folder||'';g.is_forum=false;g.actions=copy(state.editor.actions);for(const k of ['method','message','image','click_button','button_message','primary','topic','topic_id'])delete g[k];account.groups.push(g);existing.add(id);added++;}
   chooser.close();closeModal();markDirty();render();notify(`已加入 ${added} 个会话到草稿，请保存配置`);
  }
  if(action==='add-action'){state.editor.actions.push({method:'text',message:'签到'});drawEditor();}
@@ -392,7 +399,7 @@ document.addEventListener('input',event=>{
  if(el.dataset.delay){const [type,side]=el.dataset.delay.split(':'),key=type+'_delay_seconds';const values=range(state.draft[key],type==='account'?[0,0]:[1,3]);values[Number(side)]=Number(el.value);state.draft[key]=values;markDirty();}
  if(el.dataset.global){const key=el.dataset.global;state.draft[key]=el.type==='checkbox'?el.checked:key.endsWith('_keywords')?words(el.value):el.type==='number'?Number(el.value):el.value;markDirty();}
  if(el.dataset.editor){const key=el.dataset.editor;state.editor.group[key]=el.type==='checkbox'?el.checked:key.endsWith('_keywords')?words(el.value):el.value;if(key==='topic')delete state.editor.group.topic_id;if(key==='chat'){delete state.editor.group.topic;delete state.editor.group.topic_id;delete state.editor.group.is_forum;state.editor.topics=null;state.editor.topicsError='';state.editor.topicRequest=null;state.editor.topicsLoading=false;}}
- if(el.dataset.actionField){const key=el.dataset.actionField;state.editor.actions[Number(el.dataset.index)][key]=key==='image'?el.value:normalizeValue(el.value);}
+ if(el.dataset.actionField){const key=el.dataset.actionField;const action=state.editor.actions[Number(el.dataset.index)];action[key]=['image','button_message'].includes(key)||key==='click_button'&&action.method==='button_only'?el.value:normalizeValue(el.value);}
 });
 
 document.addEventListener('change',event=>{

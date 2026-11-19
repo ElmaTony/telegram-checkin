@@ -96,7 +96,9 @@ def _result(group, actions, engine=None, error=None):
     sent = any(action.get('sent') for action in actions)
     warning = '；'.join(action['warning'] for action in actions if action.get('warning'))
     draft_warning = '；'.join(action['draft_warning'] for action in actions if action.get('draft_warning')) or getattr(engine,'last_draft_warning',None) or ''
-    source = 'reply_to_sent' if any(item.get('source') == 'reply_to_sent' for item in evidence) else 'private_chat' if any(item.get('source') == 'private_chat' for item in evidence) else 'unknown'
+    sources = {item.get('source') for item in evidence}
+    source = next((kind for kind in ('button_popup', 'reply_to_sent', 'private_chat') if kind in sources), 'unknown')
+    waiting = '已点击按钮，尚未取得可关联的反馈' if any(action.get('button_only') for action in actions) else '已发送，尚未捕获与本轮消息关联的签到反馈'
     return {'chat': str(group['chat']), 'name': group.get('title') or str(group['chat']),
             'ok': merged['ok'] and not error, 'confirm': confirm,
             'clicked': merged['clicked'], 'with_image': merged['with_image'],
@@ -104,7 +106,7 @@ def _result(group, actions, engine=None, error=None):
             'draft_warning': draft_warning,
             'source': source, 'replies': trusted, 'raw_replies': replies, 'evidence': evidence,
             'actions': _jsonable(actions),
-            'result_text': '' if actual_error else pick_result_reply(group, {}, trusted, confirm) or warning or ('已发送，尚未捕获与本轮消息关联的签到反馈' if sent else ''),
+            'result_text': '' if actual_error else pick_result_reply(group, {}, trusted, confirm) or warning or (waiting if sent else ''),
             'expected_peer': getattr(engine, '_expected_peer', None),
             'actual_peer': getattr(engine, '_last_actual_peer', None)}
 
@@ -166,17 +168,20 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
         action = {'ok': False, 'clicked': False, 'with_image': False, 'error': None,
                   'sent': False, 'replies': [], 'trusted_replies': [], 'evidence': [],
                   'confirm': 'unconfirmed', 'boundary': boundary, 'sent_mids': []}
-        if method == 'command_button':
+        if method in ('command_button', 'button_only'):
             action['buttons_complete'] = False
+        button_only = method == 'button_only'
+        if button_only:
+            action['button_only'] = True
         dispatch_prepared = False
         def checkpoint(known_sent=False):
             pending = copy.deepcopy(action)
             if not known_sent:
-                pending.update(sent=None, warning='发送请求待核对；若进程中断，请先检查 Telegram，不要直接重发')
+                pending.update(sent=None, warning='操作结果待核对；若进程中断，请先检查 Telegram，避免重复签到' if button_only else '发送请求待核对；若进程中断，请先检查 Telegram，不要直接重发')
             result = _result(group, [*actions, pending], engine)
             result.update(confirm='unconfirmed', stage='awaiting_confirmation',
                           sent=True if known_sent or any(a.get('sent') for a in actions) else None,
-                          result_text='消息已发出，等待完成签到动作与反馈' if known_sent else pending['warning'])
+                          result_text=('已点击按钮，等待反馈' if button_only else '消息已发出，等待完成签到动作与反馈') if known_sent else pending['warning'])
             record_last(state, name, str(group['chat']), result, mark_date=f'{local_now():%Y-%m-%d}')
         async def before_dispatch():
             nonlocal dispatch_prepared
@@ -190,9 +195,14 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
             if remaining > 0:
                 _progress(name, '等待发送间隔', group, action=index, sent_at=group_sent_at)
                 await _wait_until(next_send_at)
-            _progress(name, '发送', group, action=index, sent_at=group_sent_at)
+            _progress(name, '点击按钮' if button_only else '发送', group, action=index, sent_at=group_sent_at)
             engine.before_send = before_dispatch
-            if method in ('image_text', 'image_only'):
+            if button_only:
+                boundary['button_only'] = True
+                today_start = local_now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+                action['button_mid'] = await engine.click_existing_button(configured['click_button'], configured.get('button_message'), today_start)
+                action.update(clicked=True, buttons_complete=True)
+            elif method in ('image_text', 'image_only'):
                 action['with_image'] = True
                 action['sent_text'] = pick(configured.get('message')) if method == 'image_text' else None
                 await engine.send_image(pick(configured.get('image')), action['sent_text'])
@@ -216,10 +226,16 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
             action['sent_mids'] = sorted(engine._active_mids)
             checkpoint(known_sent=True)
             _progress(name, '等待反馈', group, action=index, sent_at=group_sent_at)
-            action['replies'] = await _watch_feedback(engine, boundary, group, cfg, sent_mids=action['sent_mids'], started_at=getattr(engine, 'send_started_monotonic', None))
-            action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
-            action['trusted_replies'] = list(engine.last_replied)
-            action['evidence'] = list(engine.last_evidence)
+            popup = await engine.read_button_popup(float(cfg.get('reply_wait_seconds', 6))) if button_only else ''
+            if popup:
+                action.update(replies=[popup], trusted_replies=[popup], evidence=[
+                    {'source':'button_popup', 't':popup, 'mid':action['button_mid'], 'ts':time.time()}
+                ])
+            else:
+                action['replies'] = await _watch_feedback(engine, boundary, group, cfg, sent_mids=action['sent_mids'], started_at=getattr(engine, 'send_started_monotonic', None))
+                action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
+                action['trusted_replies'] = list(engine.last_replied)
+                action['evidence'] = list(engine.last_evidence)
             action['confirm'] = _judge_action(group, cfg, action)
         except asyncio.CancelledError:
             action['error'] = '用户取消任务；如已发出，请先核对反馈，不要重复发送'
@@ -239,7 +255,7 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
                 engine._next_send_at = (getattr(engine, 'send_started_monotonic', None) or time.monotonic()) + random.uniform(lo, hi)
             if getattr(error, 'uncertain', False):
                 action.update(ok=True, confirm='unconfirmed', warning=str(error))
-                if action.get('buttons_complete') is False:
+                if action.get('buttons_complete') is False and not button_only:
                     action['warning'] += '；必需按钮尚未完成，请核对原消息，不要重新发送口令'
                 group_sent_at = group_sent_at or getattr(engine, 'send_started_at', None)
                 _progress(name, '核对发送与反馈', group, action=index, sent_at=group_sent_at)
@@ -260,6 +276,8 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
                     raise
                 except Exception as feedback_error:
                     action['warning'] += f'；反馈采集未完成：{feedback_error}'
+            elif button_only and action.get('clicked'):
+                action.update(ok=True, confirm='unconfirmed', warning=f'按钮已点击，反馈读取未完成：{error}')
             else:
                 action['error'] = f'{type(error).__name__}: {error}'
                 action['confirm'] = 'failed'
@@ -278,6 +296,8 @@ async def _recheck(engine, group, result, cfg):
     await engine._scroll_chat_bottom()
     configured = group_actions(group)
     for index, action in enumerate(result['actions']):
+        if action.get('button_only'):
+            continue
         if index < len(configured) and infer_method(configured[index]) == 'command_button' and not action.get('clicked'):
             action.setdefault('buttons_complete', False)
         if action.get('buttons_complete') is False and action.get('confirm') == 'success':

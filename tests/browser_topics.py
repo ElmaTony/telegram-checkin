@@ -84,15 +84,31 @@ async def main():
   topic_error=False
   await page.get_by_role('button',name='从会话列表选择',exact=True).click()
   await page.locator('.chooser-row').filter(has_text='普通讨论群').get_by_role('button',name='选用',exact=True).click()
-  await page.get_by_text('普通会话，直接发送到当前聊天',exact=True).wait_for()
+  await page.get_by_text('已识别为普通会话 · 无话题',exact=True).wait_for()
   await page.get_by_role('button',name='保存到草稿',exact=True).click()
   await page.get_by_role('button',name='保存配置',exact=True).click()
   await page.wait_for_function("document.querySelector('#draft-indicator').hidden")
   group=cfg['accounts'][0]['groups'][1]
   assert group['chat']=='-202' and not group['is_forum'] and 'topic' not in group and 'topic_id' not in group,group
+  await page.get_by_role('button',name='添加群',exact=True).click()
+  editor=page.locator('#modal')
+  before=len(reads)
+  await editor.locator('[data-editor="chat"]').fill('704')
+  await editor.locator('[data-editor="chat"]').press('Tab')
+  await editor.get_by_text('机器人或私聊 · 无话题',exact=True).wait_for()
+  assert await editor.get_by_role('button',name='识别 / 刷新话题',exact=True).count()==0
+  assert len(reads)==before
+  await editor.get_by_role('combobox',name='动作 1 签到方式').select_option('button_only')
+  assert await editor.locator('[data-action-field="message"]').count()==0
+  await editor.get_by_role('textbox',name='按钮完整文字',exact=True).fill('✅ 点我签到')
+  await editor.get_by_role('button',name='保存到草稿',exact=True).click()
+  await page.get_by_role('button',name='保存配置',exact=True).click()
+  await page.wait_for_function("document.querySelector('#draft-indicator').hidden")
+  group=cfg['accounts'][0]['groups'][-1]
+  assert group['method']=='button_only' and group['click_button']=='✅ 点我签到' and 'message' not in group,group
   await browser.close()
  assert not errors,errors
- result={'passed':True,'api_writes_intercepted':len(posts),'topic_reads_intercepted':len(reads),'js_errors':errors,'checks':['forum_auto_detection','required_topic','exact_duplicate_title_id','topic_round_trip','ordinary_chat_clears_stale_topic','failed_scan_blocks_save','mobile_dialog']}
+ result={'passed':True,'api_writes_intercepted':len(posts),'topic_reads_intercepted':len(reads),'js_errors':errors,'checks':['forum_auto_detection','required_topic','exact_duplicate_title_id','topic_round_trip','ordinary_chat_clears_stale_topic','failed_scan_blocks_save','private_chat_has_no_topics','button_only_rule','mobile_dialog']}
  (OUT/'results.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf8')
  print(json.dumps(result))
 

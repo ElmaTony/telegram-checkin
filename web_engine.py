@@ -23,6 +23,7 @@ from pathlib import Path
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 from core.config import safe_name
+from core.logic import button_message_ref
 from core.locks import FileLock
 from core.storage import atomic_write
 from core.paths import BASE_DIR, configure_browser_path, visible_browser_available
@@ -1094,6 +1095,96 @@ class WebEngine:
             await asyncio.sleep(min(.25, max(0, deadline - time.monotonic())))
         return False
 
+    _EXISTING_BUTTON_JS = r"""({peer, mid, label, earliest, selectors}) => {
+        const normalize = value => value.replace(/[\uFE0E\uFE0F]/g,'').replace(/\s+/g,' ').trim();
+        const matches = rows => rows.filter(b => b.dataset.peerId === peer && b.checkVisibility() &&
+            (mid ? b.dataset.mid === mid : Number(b.dataset.timestamp) >= earliest))
+            .flatMap(b => [...b.querySelectorAll(selectors)].filter(el => {
+                const text = (el.querySelector('.reply-markup-button-text') || el).cloneNode(true);
+                text.querySelectorAll('img[alt]').forEach(img => img.replaceWith(img.alt));
+                return normalize(text.textContent) === normalize(label) && el.checkVisibility();
+            }).map(el => ({el, mid:Number(b.dataset.mid), ts:Number(b.dataset.timestamp || 0)})));
+        const rows = [...document.querySelectorAll('.bubbles .bubble.is-in[data-mid]')];
+        const found = matches(rows).sort((a,b) => b.ts - a.ts || b.mid - a.mid);
+        if (!found.length || found[1]?.mid === found[0].mid) return null;
+        const {el} = found[0];
+        return el.matches('button:not([href], [disabled], [aria-disabled="true"], .is-disabled)') &&
+            !el.querySelector('.reply-markup-button-icon, a, [href]') ? el : null;
+    }"""
+
+    async def click_existing_button(self, label, reference, earliest):
+        """Click one incoming message's inline button within the verified conversation."""
+        await self.assert_destination()
+        peer, mid = str(self._expected_peer), None
+        if reference:
+            mid, linked_peer, linked_topic = button_message_ref(reference)
+            if linked_peer and linked_peer not in (peer, str(self._mids_chat).lower()):
+                raise ValueError("按钮消息链接与已核对的会话不符，请使用当前会话内的链接或数字消息 ID")
+            if linked_topic and linked_topic != self._expected_topic_id:
+                raise ValueError("按钮消息链接与所选话题不符")
+            route = f'{peer}?message={mid}'
+            if self._expected_topic_id:
+                route += f'&thread={self._expected_topic_id}'
+            await self.page.evaluate('route => { location.hash = route; }', route)
+        elif not peer.isdigit():
+            raise ValueError("群聊的仅按钮签到需要指定消息链接或数字消息 ID")
+        args = {'peer':peer, 'mid':mid, 'label':label, 'earliest':earliest, 'selectors':', '.join(SEL_BTN_ROW)}
+        try:
+            handle = await self.page.wait_for_function(self._EXISTING_BUTTON_JS, arg=args, timeout=5000)
+        except PlaywrightTimeoutError as error:
+            raise RuntimeError("没有找到唯一可点的签到按钮，请核对消息位置和按钮完整文字") from error
+        try:
+            button = handle.as_element()
+            await self.assert_destination()
+            if await self.page.locator('.popup-confirmation:visible').count():
+                raise RuntimeError("当前已有 Telegram 弹窗，请先处理后再运行签到")
+            origin = await button.evaluate("el => el.closest('.bubble').dataset.mid")
+            if self.before_send:
+                await self.before_send()
+            capture_since = time.time()
+            try:
+                await button.click(timeout=2000)
+            except Exception as original:
+                error = RuntimeError("按钮点击结果待核对，请检查 Telegram，勿重复点击")
+                error.sent = error.uncertain = True
+                raise error from original
+            self._start_send_clock(capture_since)
+            return origin
+        finally:
+            await handle.dispose()
+
+    async def read_button_popup(self, seconds):
+        """Read the new Telegram callback alert before dismissing its sole OK button."""
+        remaining = self.send_started_monotonic + seconds - time.monotonic()
+        if remaining <= 0:
+            return ''
+        try:
+            handle = await self.page.wait_for_function(r"""() => {
+                const visible = el => el.checkVisibility() && el.getBoundingClientRect().height > 0;
+                const dialogs = [...document.querySelectorAll('.popup-confirmation')].filter(visible);
+                if (dialogs.length !== 1) return null;
+                const popup = dialogs[0];
+                const buttons = [...popup.querySelectorAll('.popup-buttons button, .popup-footer button')].filter(visible);
+                if (buttons.length !== 1 || !/^(确定|確認|确认|確定|好|OK|Okay)$/i.test(buttons[0].textContent.trim()) ||
+                    popup.querySelector('input, textarea, select, a[href]')) return null;
+                return popup.querySelector('.popup-description')?.textContent.trim() ? popup : null;
+            }""", timeout=max(1, int(remaining*1000)))
+        except PlaywrightTimeoutError:
+            return ''
+        try:
+            popup = handle.as_element()
+            await self.assert_destination()
+            text = await popup.eval_on_selector('.popup-description', 'el => el.innerText.trim()')
+            button = await popup.query_selector('.popup-buttons button:visible, .popup-footer button:visible')
+            try:
+                if button:
+                    await button.click(timeout=1500)
+            except PlaywrightTimeoutError:
+                log.warning('已读到机器人弹窗，关闭按钮未就绪')
+            return text
+        finally:
+            await handle.dispose()
+
     _LATEST_VIEW_JS = r"""({peer, element=false, align=false}) => {
         const visible=(el,empty=false)=>{
             if(!el?.checkVisibility())return false;
@@ -1313,7 +1404,7 @@ class WebEngine:
                     self.last_sent_mids.add(str(new))
                 if str(old) in allowed:
                     allowed.add(str(new))
-            if not allowed and known.get('sent_at'):
+            if not allowed and known.get('sent_at') and not known.get('button_only'):
                 recovered = await self.recover_sent_mids(known, self._automation_text)
                 allowed.update(recovered['sent_mids'])
                 self.last_sent_mids.update(allowed)
