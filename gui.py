@@ -14,7 +14,7 @@ import subprocess
 import threading
 import uuid
 import webbrowser
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -514,8 +514,9 @@ def _scan(account_name, folder='', refresh=False, folders_only=False, topic_chat
     # Accept subsecond skew without treating a freshly written cache as stale.
     if topic_chat is not None and not refresh and topic_cache and -1 <= local_now().timestamp()-topic_cache.get('checked_at', 0) < 300:
         return {'ok':True, **topic_cache, 'cached':True}
-    if topic_chat is None and not refresh and not folders_only and folder in cache.get('lists', {}) and all('is_forum' in item for item in cache['lists'][folder]):
-        return {'ok': True, 'dialogs': cache['lists'][folder], 'folders': cache.get('folders', []), 'cached': True, 'updated': cache.get('updated')}
+    cached_dialogs = cache.get('lists', {}).get(folder)
+    if topic_chat is None and not refresh and not folders_only and cached_dialogs and all('is_forum' in item for item in cached_dialogs):
+        return {'ok': True, 'dialogs': cached_dialogs, 'folders': cache.get('folders', []), 'cached': True, 'updated': cache.get('updated')}
     with _lock:
         job_id = _reserve('scan', scanning=True, show_browser=False)
     async def scan():
@@ -541,10 +542,12 @@ def _scan(account_name, folder='', refresh=False, folders_only=False, topic_chat
                             if result['is_forum']:dialog['type'] = '论坛群 · 含话题'
                 save_state(state)
                 return {'ok':True, **saved, 'cached':False}
-            folders = await engine.list_folders()
             if folders_only:
-                return {'ok': True, 'folders': folders}
+                return {'ok': True, 'folders': await engine.list_folders()}
             dialogs = await engine.list_chats(folder=folder or None)
+            folders = await engine.list_folders()
+            if not dialogs:
+                return {'ok': True, 'dialogs': [], 'folders': folders, 'cached': False}
             state = load_state()  # Do not overwrite with the snapshot from before scanning.
             cache = state.setdefault('_chat_cache', {}).setdefault(account_name, {})
             cache.setdefault('lists', {})[folder] = dialogs
@@ -732,7 +735,8 @@ def api_history():
     page = max(1, int(request.args.get('page', 1)))
     limit = max(1, min(1000, int(request.args.get('limit', 100))))
     rows = _history_rows()
-    return jsonify(ok=True, rows=rows[(page-1)*limit:page*limit], total=len(rows), page=page, limit=limit)
+    counts = Counter(row['status'] for row in rows)
+    return jsonify(ok=True, rows=rows[(page-1)*limit:page*limit], total=len(rows), counts=counts, page=page, limit=limit)
 
 
 @app.get('/api/history/download')

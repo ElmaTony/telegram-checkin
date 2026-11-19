@@ -217,16 +217,26 @@ async function openChooser(refresh=false){
  const account=state.draft.accounts[state.accountIndex],original=state.origins.get(account);
  if(!original||original!==account.name)throw new Error('请先保存账号及名称修改，再读取会话列表');
  const cc=state.chooser;
+ if(cc.loading)return;
+ if(cc.loadedFolder!==cc.folder){cc.dialogs=[];cc.updated=null;cc.cached=false;cc.checked.clear();}
  cc.loading=true;cc.error='';drawChooser();if(!chooser.open)chooser.showModal();
  try{
   const data=await api('/api/dialogs?'+new URLSearchParams({account:original,folder:cc.folder,...(refresh?{refresh:'1'}:{})}));
-  cc.dialogs=data.dialogs;cc.folders=data.folders||[];cc.updated=data.updated;cc.checked.clear();
- }catch(error){cc.error=error.message;}
- finally{cc.loading=false;if(chooser.open)drawChooser();}
+  cc.dialogs=data.dialogs;cc.folders=data.folders||[];cc.updated=data.updated;cc.cached=data.cached;cc.loadedFolder=cc.folder;cc.checked.clear();
+ }catch(error){cc.error=error.message;cc.cached=cc.dialogs.length>0;}
+ finally{cc.loading=false;if(state.chooser===cc&&chooser.open)drawChooser();}
 }
 function drawChooser(){
  const cc=state.chooser,list=cc.dialogs.filter(d=>(d.title+' '+d.id).toLowerCase().includes(cc.query.toLowerCase()));
- chooser.innerHTML=`<div class="dialog-heading"><h2>从 Telegram 会话中选择</h2>${button('close-chooser','返回规则编辑',{kind:'ghost'})}</div><div class="toolbar"><div class="search-group"><select data-control="chooser-folder" aria-label="Telegram 文件夹">${option('','全部会话',cc.folder)}${cc.folders.map(f=>option(f,f,cc.folder)).join('')}</select><input id="chooser-search" data-control="chooser-search" aria-label="搜索会话" placeholder="搜索会话" value="${esc(cc.query)}"></div>${button('refresh-chooser','刷新列表',{disabled:cc.loading})}</div><p class="small-note">${cc.loading?'正在读取…':`${list.length} 个会话 · 已选 ${cc.checked.size} 个${cc.updated?' · 缓存于 '+esc(cc.updated):''}`}。只读取列表，不发送消息。</p>${cc.error?`<div class="dialog-error" role="alert">${esc(cc.error)}</div>`:''}<div class="chooser-list">${list.map(d=>`<div class="chooser-row"><input type="checkbox" data-choose-check="${esc(d.id)}" aria-label="勾选 ${esc(d.title||d.id)}" ${d.is_forum?'disabled title="论坛群请单独选择话题"':''} ${cc.checked.has(String(d.id))?'checked':''}><div class="identity">${esc(d.title||d.id)}<small>${esc(d.id)} · ${esc(d.type||'')}</small></div>${button('choose-one',d.is_forum?'选择话题':'选用',{kind:'small',extra:`data-id="${esc(d.id)}"`})}</div>`).join('')||'<div class="empty-state">'+(cc.loading?'读取中…':'没有匹配的会话')+'</div>'}</div><p class="small-note">普通会话可批量添加；论坛群请单独选择话题。已有会话自动跳过。</p><div class="dialog-actions">${button('close-chooser','返回')}${button('choose-batch',`添加选中的 ${cc.checked.size} 个会话`,{primary:true,disabled:!cc.checked.size||cc.loading})}</div>`;
+ const count=cc.loading?'正在连接 Telegram 并读取会话…':`${list.length} 个会话 · 已选 ${cc.checked.size} 个${cc.updated?' · '+(cc.cached?'缓存于 ':'更新于 ')+esc(cc.updated):''}`;
+ const rows=list.map(d=>`<div class="chooser-row"><input type="checkbox" data-choose-check="${esc(d.id)}" aria-label="勾选 ${esc(d.title||d.id)}" ${cc.loading||d.is_forum?'disabled':''} ${d.is_forum?'title="论坛群请单独选择话题"':''} ${cc.checked.has(String(d.id))?'checked':''}><div class="identity">${esc(d.title||d.id)}<small>${esc(d.id)} · ${esc(d.type||'')}</small></div>${button('choose-one',d.is_forum?'选择话题':'选用',{kind:'small',disabled:cc.loading,extra:`data-id="${esc(d.id)}"`})}</div>`).join('');
+ const emptyText=cc.loading?'读取中…':cc.error?'读取未完成，可刷新列表或返回填写会话 ID。':cc.query?'没有匹配的会话':'当前列表没有会话';
+ chooser.innerHTML=`<div class="dialog-heading"><h2>从 Telegram 会话中选择</h2>${button('close-chooser','返回规则编辑',{kind:'dialog-close',iconName:'close'})}</div>
+ <div class="toolbar"><div class="search-group"><select data-control="chooser-folder" aria-label="Telegram 文件夹" ${cc.loading?'disabled':''}>${option('','全部会话',cc.folder)}${cc.folders.map(f=>option(f,f,cc.folder)).join('')}</select><input id="chooser-search" data-control="chooser-search" aria-label="搜索会话" placeholder="搜索会话" value="${esc(cc.query)}"></div>${button('refresh-chooser','刷新列表',{iconName:'refresh',disabled:cc.loading})}</div>
+ <p class="small-note" role="status">${cc.error&&!cc.dialogs.length?'会话列表读取失败':count}</p>${cc.error?`<div class="dialog-error" role="alert">${esc(cc.error)}</div>`:''}
+ <div class="chooser-list" aria-busy="${cc.loading}">${rows||`<div class="empty-state">${emptyText}</div>`}</div>
+ <p class="small-note">普通会话可批量添加；论坛群请单独选择话题。已有会话自动跳过。</p>
+ <div class="dialog-actions">${button('close-chooser','返回')}${button('choose-batch',`添加选中的 ${cc.checked.size} 个会话`,{primary:true,disabled:!cc.checked.size||cc.loading})}</div>`;
 }
 
 function plan({row=null,account=null}={}){
@@ -352,6 +362,7 @@ async function onAction(el){
   chooser.innerHTML=`<form id="judge-form"><div class="dialog-heading"><h2>判定词沙盒</h2>${button('close-chooser','返回规则编辑',{kind:'ghost'})}</div><p class="muted">粘贴机器人反馈，检查话术匹配。不会发送消息，也不代表消息已归属本账号。</p><label class="field">反馈原文<textarea name="text" rows="5" required></textarea></label><div id="judge-result" class="evidence-block" hidden></div><div class="dialog-actions"><button class="primary" type="submit">测试匹配</button></div></form>`;chooser.showModal();
  }
  if(action==='history-prev'||action==='history-next'){state.historyPage+=action==='history-prev'?-1:1;await loadHistory();}
+ if(action==='history-reset'){state.historyFilter={q:'',account:'',status:'',from:'',to:''};state.historyPage=1;await loadHistory();}
  if(action==='export-history')await download('/api/history/download?'+historyQuery(),'checkin-history.csv');
  if(action==='download-logs')await download('/api/logs/download','checkin.log');
  if(action==='refresh-logs')await loadLogs();

@@ -57,6 +57,43 @@ class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
         await self.pw.stop()
         self.draft_directory.cleanup()
 
+    async def test_dialog_scan_waits_for_active_list_after_login(self):
+        self.engine.ensure_login = AsyncMock()
+        await self.page.set_content('''
+            <div class="folders-tabs-scrollable">
+              <button data-filter-id="0" aria-selected="true" aria-controls="all-dialogs">All</button>
+            </div>
+            <div id="chatlist-container">
+              <div id="all-dialogs" class="tabs-tab active scrollable-y">
+                <canvas class="dialogs-placeholder-canvas"></canvas><ul class="chatlist"></ul>
+              </div>
+              <div class="tabs-tab inactive"><ul class="chatlist">
+                <li class="chatlist-chat" data-peer-id="-999"><span class="peer-title">Wrong folder</span></li>
+              </ul></div>
+            </div>
+            <script>
+              const list=document.querySelector('#all-dialogs .chatlist');
+              setTimeout(()=>list.innerHTML=
+                '<li class="chatlist-chat" data-peer-id="-201"><span class="is-forum"></span><span class="peer-title">Forum</span></li>',3300);
+              setTimeout(()=>list.insertAdjacentHTML('beforeend',
+                '<li class="chatlist-chat" data-peer-id="-202"><span class="peer-title">Later group</span></li>'),5100);
+            </script>
+        ''')
+        self.assertEqual(await self.engine.list_chats(), [
+            {'id':'-201','title':'Forum','is_forum':True,'type':'论坛群 · 含话题'},
+            {'id':'-202','title':'Later group','is_forum':False,'type':'群组/频道'}])
+
+    async def test_dialog_scan_distinguishes_loading_from_explicit_empty_folder(self):
+        await self.page.set_content('''<div id="chatlist-container"><div class="tabs-tab active chatlist-parts">
+          <canvas class="dialogs-placeholder-canvas"></canvas><ul class="chatlist"></ul></div></div>''')
+        with self.assertRaisesRegex(RuntimeError,'未返回会话列表'):
+            await self.engine._wait_dialog_list(timeout=200)
+        await self.page.locator('.chatlist-parts').evaluate('''el=>{
+            el.dataset.placeholderType='folder';el.innerHTML+='<div class="empty-placeholder">Empty</div>';
+        }''')
+        self.engine.ensure_login = AsyncMock()
+        self.assertEqual(await self.engine.list_chats(), [])
+
     async def bubble(self,mid,text,reply=None,age=0,out=False):
         await self.page.evaluate('''({mid,text,reply,age,out})=>{
             const b=document.createElement('div');b.className='bubble '+(out?'is-out':'is-in');

@@ -15,7 +15,7 @@ OUT=ROOT/'audit/ui-topics';OUT.mkdir(parents=True,exist_ok=True)
 async def main():
  cfg={'accounts':[{'name':'示例账号','groups':[{'chat':'-101','title':'原有会话','method':'text','message':'签到'}]}]}
  status={'today':'2026-11-06','busy':False,'job':None,'progress':{},'probe':{},'accounts':[{'name':'示例账号','status':'上次已登录','done':0,'total':1,'groups':[{'chat':'-101','name':'原有会话','method':'text','confirm':None}]}]}
- posts=[];reads=[];errors=[];topic_error=False
+ posts=[];reads=[];errors=[];topic_error=False;dialog_error=True
  async def intercept(route):
   nonlocal cfg
   request=route.request;url=urlparse(request.url);query=parse_qs(url.query)
@@ -25,6 +25,7 @@ async def main():
    return await route.fulfill(json={'ok':True,'revision':'saved'})
   if url.path=='/api/config':return await route.fulfill(json={**cfg,'_revision':'fixture'})
   if url.path=='/api/status':return await route.fulfill(json=status)
+  if url.path=='/api/dialogs' and dialog_error:return await route.fulfill(status=409,json={'ok':False,'error':'Telegram 会话列表尚未加载完成，请刷新重试。'})
   if url.path=='/api/dialogs':return await route.fulfill(json={'ok':True,'dialogs':[
    {'id':'-201','title':'会员俱乐部','type':'论坛群 · 含话题','is_forum':True},
    {'id':'-202','title':'普通讨论群','type':'群组/频道','is_forum':False},
@@ -41,7 +42,17 @@ async def main():
   await page.route('**/api/**',intercept)
   await page.goto(BASE_URL+'/#accounts')
   await page.get_by_role('button',name='添加群',exact=True).click()
+  close=page.locator('#modal').get_by_role('button',name='关闭',exact=True)
+  assert await close.locator('svg').count()==1
+  await close.click()
+  assert not await page.locator('#modal').is_visible()
+  await page.get_by_role('button',name='添加群',exact=True).click()
   await page.get_by_role('button',name='从会话列表选择',exact=True).click()
+  await page.get_by_text('会话列表读取失败',exact=True).wait_for()
+  assert await page.locator('#chooser [role=alert]').count()==1
+  dialog_error=False
+  await page.get_by_role('button',name='刷新列表',exact=True).click()
+  await page.get_by_role('checkbox',name='勾选 会员俱乐部',exact=True).wait_for()
   assert await page.get_by_role('checkbox',name='勾选 会员俱乐部',exact=True).is_disabled()
   await page.get_by_role('button',name='选择话题',exact=True).click()
   await page.get_by_role('combobox',name='签到发送话题',exact=True).wait_for()

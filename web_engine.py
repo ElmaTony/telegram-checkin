@@ -21,7 +21,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 from core.config import safe_name
 from core.locks import FileLock
 from core.storage import atomic_write
@@ -1358,7 +1358,7 @@ class WebEngine:
     async def list_folders(self):
         """列出 Telegram 的会话分组（文件夹）名称。只读，不发送任何消息。"""
         await self.ensure_login()
-        await self.page.wait_for_timeout(1200)
+        await self._wait_dialog_list()
         return await self._list_folders_raw()
 
     async def _open_folder(self, name):
@@ -1446,54 +1446,67 @@ class WebEngine:
         if not found:raise RuntimeError('已识别论坛群，但未读取到话题，请刷新后选择')
         return {'is_forum':True,'topics':list(found.values())}
 
-    async def list_chats(self, folder=None, on_progress=None):
-        """列出账号内的会话（可指定分组名，滚动加载全量）。
+    _DIALOG_LIST_JS = r"""({scroll=false, reset=false, readyOnly=false} = {}) => {
+        const visible = el => el?.checkVisibility() && el.getBoundingClientRect().width > 0;
+        const main = document.querySelector('#chatlist-container') || document;
+        const selected = document.querySelector('.folders-tabs-scrollable [aria-selected="true"][aria-controls]');
+        const pane = selected && document.getElementById(selected.getAttribute('aria-controls'));
+        const lists = [...(pane || main).querySelectorAll('ul.chatlist')].filter(list => {
+            const scroller = list.closest('.scrollable-y');
+            const tab = list.closest('.tabs-tab');
+            return visible(list) && visible(scroller || list) && !list.closest('.topics-slider') &&
+                (!tab || tab.classList.contains('active'));
+        });
+        const populated = lists.find(el => el.querySelector('.chatlist-chat[data-peer-id]'));
+        const empty = [...(pane || main).querySelectorAll('.chatlist-parts.active[data-placeholder-type] > .empty-placeholder')].some(visible);
+        if (readyOnly) return !!populated || empty;
+        const list = populated || lists[0];
+        if (!list) return {items: [], moved: false, empty, atEnd: false};
+        const scroller = list.closest('.scrollable-y');
+        const items = lists.filter(el => el.closest('.scrollable-y') === scroller)
+            .flatMap(el => [...el.querySelectorAll('.chatlist-chat[data-peer-id]')]).map(row => ({
+            pid: row.dataset.peerId,
+            is_forum: row.classList.contains('is-forum') || !!row.querySelector('.is-forum'),
+            title: row.querySelector('.user-title, .peer-title')?.textContent.trim() || ''
+        }));
+        const previous = scroller?.scrollTop;
+        if (scroller && reset) scroller.scrollTop = 0;
+        if (scroller && scroll) scroller.scrollTop += Math.max(1, scroller.clientHeight * .8);
+        const atEnd = !scroller || scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
+        return {items, moved: !!scroller && scroller.scrollTop !== previous, empty: !items.length && empty, atEnd};
+    }"""
 
-        只读取页面元素：不点击会话、不发送任何消息。K 的会话列表是虚拟
-        渲染，必须逐步滚动才能让全部会话进入 DOM。
-        """
+    async def _wait_dialog_list(self, timeout=18000):
+        try:
+            handle = await self.page.wait_for_function(self._DIALOG_LIST_JS, arg={'readyOnly': True}, timeout=timeout)
+            await handle.dispose()
+        except PlaywrightTimeoutError as error:
+            raise RuntimeError('Telegram 未返回会话列表。请刷新重试，或返回后输入会话 ID / @用户名。') from error
+
+    async def list_chats(self, folder=None, on_progress=None):
+        """Wait for the active chat list before reading its virtualized rows."""
         await self.ensure_login()
-        await self.page.wait_for_timeout(1200)
+        await self._wait_dialog_list()
         if folder:
             if not await self._open_folder(folder):
                 raise RuntimeError(f'文件夹「{folder}」不存在或无法打开')
+            await self._wait_dialog_list()
         else:
-            for name in ('所有', 'All', 'All Chats', '全部', '全部聊天', '所有聊天'):
-                if await self._open_folder(name):
-                    break
-        await self.page.evaluate(self._SCROLL_TOP_JS)
+            all_chats = self.page.locator('.folders-tabs-scrollable [data-filter-id="0"]:visible').first
+            if await all_chats.count() and await all_chats.get_attribute('aria-selected') != 'true':
+                await all_chats.click(timeout=2500)
+                await all_chats.and_(self.page.locator('[aria-selected="true"]')).wait_for(timeout=3500)
+                await self._wait_dialog_list()
+        initial = await self.page.evaluate(self._DIALOG_LIST_JS, {'reset': True})
+        if initial.get('empty'):
+            return []
         await asyncio.sleep(.15)
-        js = r"""() => {
-            const uls = [...document.querySelectorAll('ul.chatlist')];
-            let target = null, bestH = 0;
-            for (const ul of uls) {
-                const tab = ul.closest('.tabs-tab');
-                const active = !tab || tab.className.includes('active');
-                const r = ul.getBoundingClientRect();
-                if (ul.checkVisibility() && !ul.closest('.topics-slider') && r.height > 0 && active && r.height > bestH) { target = ul; bestH = r.height; }
-            }
-            if (!target) return {items: [], moved: false};
-            const items = [...target.querySelectorAll('.chatlist-chat')].map(el => ({
-                pid: el.getAttribute('data-peer-id'),
-                is_forum: !!el.querySelector('.is-forum'),
-                title: ((el.querySelector('.user-title, .peer-title') || {})
-                        .textContent || '').trim(),
-            }));
-            let sc = target;
-            while (sc && !(sc.classList && sc.classList.contains('scrollable-y')))
-                sc = sc.parentElement;
-            let moved = false;
-            if (sc) {
-                const before = sc.scrollTop;
-                sc.scrollTop = Math.min(sc.scrollTop + sc.clientHeight * 0.8, sc.scrollHeight);
-                moved = sc.scrollTop !== before;
-            }
-            return {items, moved};
-        }"""
         result, seen = [], set()
-        stable = 0
-        for step in range(250):
-            data = await self.page.evaluate(js)
+        end_since = None
+        complete = False
+        loop = asyncio.get_running_loop()
+        for _ in range(250):
+            data = await self.page.evaluate(self._DIALOG_LIST_JS, {'scroll': True})
             added = 0
             for it in data.get("items", []):
                 pid = it.get("pid")
@@ -1511,29 +1524,23 @@ class WebEngine:
             if on_progress is None and added and \
                     (len(result) // 50) > ((len(result) - added) // 50):
                 log.info("已读取 %d 个会话…", len(result))
-            if not data.get("moved") and not added:
-                stable += 1
-                if stable >= 3:
+            if data['atEnd'] and not data['moved'] and not added:
+                if end_since is None:
+                    end_since = loop.time()
+                # Telegram can fetch another page asynchronously at the current bottom.
+                if loop.time() - end_since >= 3:
+                    complete = True
                     break
             else:
-                stable = 0
+                end_since = None
             await asyncio.sleep(0.3)
         # 回到列表顶部，避免影响后续操作
         try:
-            await self.page.evaluate("""() => {
-                const uls = [...document.querySelectorAll('ul.chatlist')];
-                for (const ul of uls) {
-                    const r = ul.getBoundingClientRect();
-                    if (r.height > 0) {
-                        let sc = ul;
-                        while (sc && !(sc.classList && sc.classList.contains('scrollable-y')))
-                            sc = sc.parentElement;
-                        if (sc) sc.scrollTop = 0;
-                    }
-                }
-            }""")
+            await self.page.evaluate(self._DIALOG_LIST_JS, {'reset': True})
         except Exception:
             pass
+        if not result or not complete:
+            raise RuntimeError('Telegram 会话列表尚未加载完成，请刷新重试。')
         return result
 
 

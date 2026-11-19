@@ -164,6 +164,24 @@ class IsolatedFiles(unittest.TestCase):
         self.assertEqual(self.client.get('/api/topics?account=Unknown&chat=-101').status_code,400)
         self.assertEqual(self.client.get('/api/topics?account=Audit&chat=@not_numeric').status_code,400)
 
+    def test_empty_legacy_dialog_cache_is_rescanned_and_does_not_poison_good_cache(self):
+        state.save_state({'_chat_cache':{'Audit':{'lists':{'':[]}}}})
+        dialogs=[{'id':'-201','title':'Fixture group','is_forum':False}]
+        with patch.object(gui,'call',side_effect=lambda coro, **kw:asyncio.run(coro)), \
+             patch.object(web_engine,'WebEngine') as engine:
+            scanner=engine.return_value
+            scanner.launch=AsyncMock();scanner.close=AsyncMock();scanner.list_folders=AsyncMock(return_value=[])
+            scanner.list_chats=AsyncMock(side_effect=[dialogs,RuntimeError('Telegram did not load')])
+            response=self.client.get('/api/dialogs?account=Audit')
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(response.json['dialogs'],dialogs)
+            self.assertFalse(response.json['cached'])
+            self.assertEqual(self.client.get('/api/dialogs?account=Audit&refresh=1').status_code,409)
+            again=self.client.get('/api/dialogs?account=Audit')
+            self.assertTrue(again.json['cached'])
+            self.assertEqual(again.json['dialogs'],dialogs)
+            self.assertEqual(scanner.list_chats.await_count,2)
+
     def test_topic_scan_respects_running_job(self):
         self.client.post('/api/checkin_now',json={})
         response=self.client.get('/api/topics?account=Audit&chat=-101&refresh=1')

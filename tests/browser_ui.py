@@ -55,7 +55,15 @@ async def main():
   if path=='/api/status':return await route.fulfill(json=status)
   if path=='/api/dialogs':return await route.fulfill(json={'ok':True,'dialogs':[{'id':'-401','title':"O'Reilly <group>",'type':'群组','is_forum':False},{'id':'-402','title':'新社区','type':'群组','is_forum':False}],'folders':['签到'],'cached':True,'updated':'2026-10-30 20:00'})
   if path=='/api/topics':return await route.fulfill(json={'ok':True,'is_forum':False,'topics':[]})
-  if path=='/api/history':return await route.fulfill(json={'ok':True,'rows':[{'time':'2026-10-30 09:32:00','account':'主账号','group':'开发者社区','status':'失败','detail':'目标核对失败'}],'total':1,'page':1,'limit':100})
+  if path=='/api/history':
+   if 'q=Target' in req.url:return await route.fulfill(json={'ok':True,'rows':[],'total':0,'counts':{},'page':1,'limit':100})
+   rows=[{'time':f'2026-10-{day} 09:32:{i:02}','account':'主账号','group':group,'status':status,'detail':detail}
+         for i,(day,group,status,detail) in enumerate([
+          (30,'开发者社区','失败','目标核对失败：页面仍停留在上一个会话。' * 5),
+          (30,'摄影交流','未确认','已发送，等待本次发送关联的签到反馈。'),
+          (30,'读书小组','成功','签到成功，获得 10 积分。\n今日累计 45 积分。'),
+          (29,'开源讨论','成功','已签到，连续签到 7 天。')])]
+   return await route.fulfill(json={'ok':True,'rows':rows,'total':4,'counts':{'失败':1,'成功':2,'未确认':1},'page':1,'limit':100})
   if path=='/api/stats':return await route.fulfill(json={'ok':True,'total':{'成功':2,'未确认':1,'失败':1},'per_day':[{'date':'2026-10-30','成功':2,'未确认':1,'失败':1}],'per_acc':[{'account':'主账号','成功':2,'未确认':1,'失败':1}]})
   if path=='/api/logs':return await route.fulfill(json={'ok':True,'text':'2026-10-30 [INFO] 本地测试日志\n'})
   return await route.fulfill(body='fixture data',content_type='text/plain')
@@ -137,6 +145,13 @@ async def main():
   assert await page.get_by_role('spinbutton',name='账号间隔最小值').input_value()=='2'
   assert await page.get_by_role('spinbutton',name='账号间隔最大值').input_value()=='2'
   await page.get_by_role('spinbutton',name='反馈窗口上限（秒）').fill('23')
+  await page.locator('.account-card').nth(1).click(position={'x':10,'y':9})
+  assert await page.get_by_role('textbox',name='账号名称',exact=True).input_value()=='备用账号'
+  assert await page.get_by_role('button',name='管理会话：备用账号').get_attribute('aria-pressed')=='true'
+  assert not await page.locator('#modal').is_visible()
+  await page.get_by_role('button',name='管理会话：主账号').press('Space')
+  assert await page.get_by_role('textbox',name='账号名称',exact=True).input_value()=='主账号'
+  assert await page.get_by_role('spinbutton',name='反馈窗口上限（秒）').input_value()=='23'
   await page.locator('[data-action="edit-group"][data-index="0"]').click()
   await page.get_by_role('textbox',name='论坛话题',exact=True).fill('每日签到新话题')
   await page.get_by_role('button',name='保存到草稿',exact=True).click()
@@ -196,8 +211,24 @@ async def main():
   await page.get_by_role('button',name='取消任务',exact=True).first.wait_for()
   await page.get_by_role('button',name='取消任务',exact=True).first.click()
   await page.get_by_role('button',name='执行记录',exact=True).click()
+  await page.locator('.history-entry').first.wait_for()
+  assert await page.locator('.history-day').count()==2
+  assert await page.locator('.history-entry summary').first.evaluate('el=>el.getBoundingClientRect().height<65')
+  assert await page.locator('.history-preview').first.evaluate('el=>el.getBoundingClientRect().width>200')
+  await page.locator('.history-entry summary').first.click()
+  assert await page.locator('details[open] .history-detail').count()==1
+  assert (await page.locator('details[open] .history-detail').inner_text()).count('目标核对失败')==5
+  await page.evaluate('document.querySelector("#notifications").replaceChildren()')
+  await page.screenshot(path=str(OUT/'history-desktop.png'))
+  await page.set_viewport_size({'width':390,'height':900})
+  assert await page.evaluate('document.documentElement.scrollWidth<=innerWidth+1')
+  await page.screenshot(path=str(OUT/'history-mobile.png'))
+  await page.set_viewport_size({'width':1440,'height':1050})
   await page.get_by_role('textbox',name='关键词',exact=True).fill('Target')
   await page.get_by_role('button',name='筛选',exact=True).click()
+  await page.get_by_text('没有匹配的执行记录',exact=True).wait_for()
+  await page.get_by_role('button',name='清空筛选',exact=True).click()
+  await page.locator('.history-entry').first.wait_for()
   await page.get_by_role('button',name='统计',exact=True).click()
   await page.get_by_text('共 4 次记录',exact=False).wait_for()
   await page.get_by_role('button',name='运行日志',exact=True).click()
