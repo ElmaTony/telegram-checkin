@@ -1446,7 +1446,7 @@ class WebEngine:
         if not found:raise RuntimeError('已识别论坛群，但未读取到话题，请刷新后选择')
         return {'is_forum':True,'topics':list(found.values())}
 
-    _DIALOG_LIST_JS = r"""({scroll=false, reset=false, readyOnly=false} = {}) => {
+    _DIALOG_LIST_JS = r"""({position=0, advance=false, readyOnly=false} = {}) => {
         const visible = el => el?.checkVisibility() && el.getBoundingClientRect().width > 0;
         const main = document.querySelector('#chatlist-container') || document;
         const selected = document.querySelector('.folders-tabs-scrollable [aria-selected="true"][aria-controls]');
@@ -1461,19 +1461,25 @@ class WebEngine:
         const empty = [...(pane || main).querySelectorAll('.chatlist-parts.active[data-placeholder-type] > .empty-placeholder')].some(visible);
         if (readyOnly) return !!populated || empty;
         const list = populated || lists[0];
-        if (!list) return {items: [], moved: false, empty, atEnd: false};
+        if (!list) return {items: [], next: position, empty, atEnd: false};
         const scroller = list.closest('.scrollable-y');
+        const bottom = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight) : 0;
+        const current = Math.min(position, bottom);
+        if (scroller && Math.abs(scroller.scrollTop - current) > 1) {
+            // Repainting the list can move the scroll bar independently of the scan.
+            scroller.scrollTop = current;
+            return {items: [], next: current, empty: false, atEnd: false};
+        }
         const items = lists.filter(el => el.closest('.scrollable-y') === scroller)
             .flatMap(el => [...el.querySelectorAll('.chatlist-chat[data-peer-id]')]).map(row => ({
             pid: row.dataset.peerId,
             is_forum: row.classList.contains('is-forum') || !!row.querySelector('.is-forum'),
             title: row.querySelector('.user-title, .peer-title')?.textContent.trim() || ''
         }));
-        const previous = scroller?.scrollTop;
-        if (scroller && reset) scroller.scrollTop = 0;
-        if (scroller && scroll) scroller.scrollTop += Math.max(1, scroller.clientHeight * .8);
-        const atEnd = !scroller || scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
-        return {items, moved: !!scroller && scroller.scrollTop !== previous, empty: !items.length && empty, atEnd};
+        const atEnd = current >= bottom - 1;
+        const next = advance && scroller && items.length ? Math.min(bottom, current + Math.max(1, scroller.clientHeight * .8)) : current;
+        if (scroller && next > current) scroller.scrollTop = next;
+        return {items, next, empty: !items.length && empty, atEnd};
     }"""
 
     async def _wait_dialog_list(self, timeout=18000):
@@ -1497,16 +1503,18 @@ class WebEngine:
                 await all_chats.click(timeout=2500)
                 await all_chats.and_(self.page.locator('[aria-selected="true"]')).wait_for(timeout=3500)
                 await self._wait_dialog_list()
-        initial = await self.page.evaluate(self._DIALOG_LIST_JS, {'reset': True})
+        initial = await self.page.evaluate(self._DIALOG_LIST_JS, {})
         if initial.get('empty'):
             return []
         await asyncio.sleep(.15)
         result, seen = [], set()
+        position = 0
         end_since = None
         complete = False
         loop = asyncio.get_running_loop()
         for _ in range(250):
-            data = await self.page.evaluate(self._DIALOG_LIST_JS, {'scroll': True})
+            data = await self.page.evaluate(self._DIALOG_LIST_JS, {'position': position, 'advance': True})
+            position = data['next']
             added = 0
             for it in data.get("items", []):
                 pid = it.get("pid")
@@ -1524,7 +1532,7 @@ class WebEngine:
             if on_progress is None and added and \
                     (len(result) // 50) > ((len(result) - added) // 50):
                 log.info("已读取 %d 个会话…", len(result))
-            if data['atEnd'] and not data['moved'] and not added:
+            if data['atEnd'] and not added:
                 if end_since is None:
                     end_since = loop.time()
                 # Telegram can fetch another page asynchronously at the current bottom.
@@ -1536,7 +1544,7 @@ class WebEngine:
             await asyncio.sleep(0.3)
         # 回到列表顶部，避免影响后续操作
         try:
-            await self.page.evaluate(self._DIALOG_LIST_JS, {'reset': True})
+            await self.page.evaluate(self._DIALOG_LIST_JS, {})
         except Exception:
             pass
         if not result or not complete:

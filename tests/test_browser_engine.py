@@ -94,6 +94,39 @@ class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
         self.engine.ensure_login = AsyncMock()
         self.assertEqual(await self.engine.list_chats(), [])
 
+    async def test_dialog_scan_recovers_when_virtual_list_jumps_to_bottom(self):
+        self.engine.ensure_login = AsyncMock()
+        await self.page.set_content('''
+            <div id="chatlist-container" class="scrollable-y" style="height:120px;overflow:auto">
+              <ul class="chatlist" style="margin:0;height:480px;position:relative;list-style:none"></ul>
+            </div>
+            <script>
+              const scroller=document.querySelector('.scrollable-y');
+              const list=scroller.querySelector('ul');
+              let jumped=false;
+              function render(){
+                if(!jumped&&scroller.scrollTop>=140){
+                  jumped=true;
+                  scroller.scrollTop=scroller.scrollHeight;
+                }
+                const first=Math.floor(scroller.scrollTop/20);
+                list.replaceChildren();
+                for(let i=first;i<Math.min(first+7,24);i++){
+                  const row=document.createElement('li');
+                  row.className='chatlist-chat';
+                  row.dataset.peerId=String(-300-i);
+                  row.style.cssText='position:absolute;height:20px;top:'+i*20+'px';
+                  row.innerHTML='<span class="peer-title">Fixture Group</span>';
+                  list.append(row);
+                }
+              }
+              scroller.addEventListener('scroll',render);
+              render();
+            </script>
+        ''')
+        dialogs = await self.engine.list_chats()
+        self.assertEqual({row['id'] for row in dialogs}, {str(-300-i) for i in range(24)})
+
     async def bubble(self,mid,text,reply=None,age=0,out=False):
         await self.page.evaluate('''({mid,text,reply,age,out})=>{
             const b=document.createElement('div');b.className='bubble '+(out?'is-out':'is-in');
