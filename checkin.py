@@ -173,8 +173,8 @@ def selftest():
     _S.save_state = lambda st: None      # 纯内存，不落盘
     _R.append_history = lambda *a, **k: None
     try:
-        from datetime import datetime as _dt
-        _t = _dt.now().strftime("%Y-%m-%d")
+        from core.timeutil import now as _now
+        _t = _now().strftime("%Y-%m-%d")
         _st = {}
         # A 先尝试并失败，B 成功，C 还没轮到
         _S.record_last(_st, "ACC", "A", {"ok": False, "confirm": "failed", "replies": []})
