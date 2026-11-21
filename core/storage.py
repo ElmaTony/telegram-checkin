@@ -4,6 +4,8 @@ import tempfile
 import time
 from pathlib import Path
 
+_WINDOWS = os.name == "nt"
+
 
 def atomic_write(path, text):
     path = Path(path)
@@ -24,7 +26,7 @@ def atomic_write(path, text):
                 os.replace(temporary, path)
                 break
             except PermissionError:
-                if os.name != "nt" or attempt == 7:
+                if not _WINDOWS or attempt == 7:
                     raise
                 time.sleep(0.01 * (attempt + 1))
     finally:

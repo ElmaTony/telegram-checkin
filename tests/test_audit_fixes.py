@@ -51,7 +51,7 @@ class AuditFixUnitTests(unittest.TestCase):
                     raise PermissionError('busy')
                 return real_replace(src, dst)
 
-            with patch.object(storage.os, 'name', 'nt'), patch.object(storage.os, 'replace', side_effect=flaky_replace), patch.object(storage.time, 'sleep'):
+            with patch.object(storage, '_WINDOWS', True), patch.object(storage.os, 'replace', side_effect=flaky_replace), patch.object(storage.time, 'sleep'):
                 storage.atomic_write(target, '{"ok":true}')
             self.assertEqual(calls['n'], 3)
             self.assertEqual(target.read_text(encoding='utf-8'), '{"ok":true}')

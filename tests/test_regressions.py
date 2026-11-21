@@ -18,6 +18,7 @@ import core.config as config
 import core.state as state
 import core.runner as runner
 import core.history as history
+import core.timeutil as timeutil
 import web_engine
 from core.locks import FileLock
 from core.logic import judge_replies, pick_result_reply, feedback_hint
@@ -275,13 +276,13 @@ class IsolatedFiles(unittest.TestCase):
         self.assertEqual(gui.TRIGGER['chats'],['-101'])
 
     def test_legacy_result_cannot_be_rechecked_without_message_evidence(self):
-        state.save_state({'_last': {'Audit': {'-101': {'date': f'{datetime.now():%Y-%m-%d}', 'confirm': 'unconfirmed'}}}})
+        state.save_state({'_last': {'Audit': {'-101': {'date': f'{timeutil.now(FIXTURE):%Y-%m-%d}', 'confirm': 'unconfirmed'}}}})
         response = self.client.post('/api/recheck', json={'account': 'Audit', 'chats': ['-101']})
         self.assertEqual(response.status_code, 400)
         self.assertFalse(gui.BOT['busy'])
 
     def test_missing_id_send_with_reliable_boundary_can_be_inspected_readonly(self):
-        saved={'date':f'{datetime.now():%Y-%m-%d}','confirm':'unconfirmed','actions':[{
+        saved={'date':f'{timeutil.now(FIXTURE):%Y-%m-%d}','confirm':'unconfirmed','actions':[{
             'sent':True,'sent_mids':[],'boundary':{'peer':'-101','cutoff':time.time()}}]}
         state.save_state({'_last':{'Audit':{'-101':saved}}})
         self.assertTrue(self.client.get('/api/status').json['accounts'][0]['groups'][0]['can_recheck'])
@@ -290,13 +291,13 @@ class IsolatedFiles(unittest.TestCase):
         self.assertEqual(gui.TRIGGER['mode'],'recheck')
 
     def test_legacy_success_is_labelled_without_fabricating_evidence(self):
-        state.save_state({'_last': {'Audit': {'-101': {'date': f'{datetime.now():%Y-%m-%d}', 'confirm': 'success', 'detail': 'old text'}}}})
+        state.save_state({'_last': {'Audit': {'-101': {'date': f'{timeutil.now(FIXTURE):%Y-%m-%d}', 'confirm': 'success', 'detail': 'old text'}}}})
         group = self.client.get('/api/status').json['accounts'][0]['groups'][0]
         self.assertEqual(group['source'], 'legacy')
         self.assertFalse(group['can_recheck'])
 
     def test_unattributed_success_is_exposed_as_candidate_without_marking_success(self):
-        state.save_state({'_last':{'Audit':{'-101':{'date':f'{datetime.now():%Y-%m-%d}','confirm':'unconfirmed',
+        state.save_state({'_last':{'Audit':{'-101':{'date':f'{timeutil.now(FIXTURE):%Y-%m-%d}','confirm':'unconfirmed',
             'evidence':[{'mid':'20','t':'签到成功，积分 +5','source':'unrelated'}]}}}})
         group=self.client.get('/api/status').json['accounts'][0]['groups'][0]
         self.assertEqual(group['confirm'],'unconfirmed')
@@ -367,7 +368,7 @@ class IsolatedFiles(unittest.TestCase):
         self.assertEqual(config.load_config(), FIXTURE)
 
     def test_rename_preserves_daily_state_and_cache(self):
-        today = f'{datetime.now():%Y-%m-%d}'
+        today = f'{timeutil.now(FIXTURE):%Y-%m-%d}'
         state.save_state({'Audit': {'-101': today}, '_last': {'Audit': {'-101': {'date': today}}}, '_chat_cache': {'Audit': {'lists': {}}}})
         changed = copy.deepcopy(FIXTURE)
         changed['accounts'][0]['name'] = 'Renamed'
