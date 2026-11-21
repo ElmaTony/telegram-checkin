@@ -26,6 +26,7 @@
     gui.py/gui.html   本地网页控制台
 """
 
+import argparse
 import asyncio
 import logging
 import sys
@@ -37,6 +38,7 @@ from core.logic import (click_steps, group_actions, infer_method,
                         judge_replies, merge_action_results)
 from core.runner import run_web_round, clean_title
 from core.state import load_state
+from core.timeutil import now as local_now
 from core import scheduler, notifications
 
 log = logging.getLogger("checkin")
@@ -211,27 +213,35 @@ def parse_only(argv):
     return None
 
 
-async def main():
+async def main(only=None):
     setup_logging()
     cfg = load_config()
-    only = parse_only(sys.argv[1:])
+    if only is None:
+        only = parse_only(sys.argv[1:])
     if not cfg.get("accounts"):
         sys.exit("尚未配置账号，请先打开控制台添加账号与会话")
     if only and only not in {a["name"] for a in cfg["accounts"]}:
         sys.exit(f"找不到账号：{only}")
     state = load_state()
+    round_date = f"{local_now(cfg):%Y-%m-%d}"
 
     log.info("开始签到%s（单次执行，跑完即退出）",
              f"（账号：{only}）" if only else "")
     try:
         retry_map = await run_web_round(cfg, state, only)
     except asyncio.CancelledError:
-        await notifications.notify_round(cfg, state, only=only, cancelled=True)
+        await notifications.notify_round(cfg, state, only=only, cancelled=True, today=round_date)
+        raise
+    except RuntimeError as error:
+        if "正在被其他进程使用" in str(error):
+            log.warning("%s", error)
+            return 1
+        await notifications.notify_round(cfg, state, only=only, error='任务异常', today=round_date)
         raise
     except Exception:
-        await notifications.notify_round(cfg, state, only=only, error='任务异常')
+        await notifications.notify_round(cfg, state, only=only, error='任务异常', today=round_date)
         raise
-    await notifications.notify_round(cfg, state, only=only)
+    await notifications.notify_round(cfg, state, only=only, today=round_date)
     if retry_map:
         log.warning("有未成功的群（可在 GUI 总览点单个群重签）：%s", retry_map)
     else:
@@ -257,9 +267,11 @@ async def scheduled_main():
         finally:
             reserve.release()
         cfg = dict(cfg)
-        cfg['web_headless'] = cfg.get('schedule', {}).get('headless', True)
-        selected = cfg.get('schedule', {}).get('accounts', [])
-        state = {}
+        schedule = cfg.get('schedule') if isinstance(cfg.get('schedule'), dict) else {}
+        cfg['web_headless'] = schedule.get('headless', True)
+        selected = schedule.get('accounts', [])
+        round_date = f"{local_now(cfg):%Y-%m-%d}"
+        state = None
         status, error = 'completed', ''
         try:
             scheduler.complete(job_id, 'running', cfg=cfg)
@@ -267,13 +279,21 @@ async def scheduled_main():
             await run_web_round(cfg, state, accounts=selected)
         except asyncio.CancelledError:
             status = 'cancelled'
-            await notifications.notify_round(cfg, state, accounts=selected, cancelled=True, source='每日定时签到')
+            await notifications.notify_round(cfg, state or {}, accounts=selected, cancelled=True, source='每日定时签到', today=round_date)
             raise
         except Exception as failure:
             status, error = 'failed', str(failure)
-            await notifications.notify_round(cfg, state, accounts=selected, error='任务异常', source='每日定时签到')
+            log.exception("定时签到任务执行失败")
+            if state is not None:
+                await notifications.notify_round(cfg, state, accounts=selected, error='任务异常', source='每日定时签到', today=round_date)
+            elif (cfg.get('notifications') or {}).get('enabled'):
+                await asyncio.to_thread(
+                    notifications.send, '❌ 签到任务中断',
+                    '## 📋 签到结果\n\n> ❌ 定时签到未能读取运行状态，已停止执行；请在控制台核对状态文件与运行日志。',
+                    cfg=cfg, short='定时签到任务异常中断',
+                )
         else:
-            await notifications.notify_round(cfg, state, accounts=selected, source='每日定时签到')
+            await notifications.notify_round(cfg, state, accounts=selected, source='每日定时签到', today=round_date)
         finally:
             scheduler.complete(job_id, status, error, cfg)
         return True
@@ -282,19 +302,33 @@ async def scheduled_main():
     await scheduler.DailyScheduler(load_config, submit).run()
 
 
+def _parse_cli(argv):
+    parser = argparse.ArgumentParser(description='Telegram 自动签到')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--gui', action='store_true', help='打开网页控制台')
+    mode.add_argument('--selftest', action='store_true', help='跑逻辑自检（不连接 Telegram）')
+    mode.add_argument('--schedule', action='store_true', help='每日定时服务（无需打开 GUI）')
+    mode.add_argument('--notify-test', action='store_true', help='测试 Server酱微信推送')
+    parser.add_argument('--account', help='只跑指定账号（仅用于单次签到）')
+    args = parser.parse_args(argv)
+    if args.account and (args.gui or args.selftest or args.schedule or args.notify_test):
+        parser.error('--account 仅可用于单次执行签到')
+    return args
+
+
 if __name__ == "__main__":
-    argv = sys.argv[1:]
-    if "--gui" in argv:
+    args = _parse_cli(sys.argv[1:])
+    if args.gui:
         import gui
         gui.run()
-    elif "--selftest" in argv:
+    elif args.selftest:
         sys.exit(selftest())
-    elif "--notify-test" in argv:
+    elif args.notify_test:
         setup_logging()
         result = notifications.send_preview(load_config(), load_state())
         sys.exit(0 if result['ok'] else 1)
     else:
         try:
-            sys.exit(asyncio.run(scheduled_main() if '--schedule' in argv else main()))
+            sys.exit(asyncio.run(scheduled_main() if args.schedule else main(args.account)))
         except KeyboardInterrupt:
             print("\n已中断")

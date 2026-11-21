@@ -6,10 +6,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from . import BASE_DIR
 from .storage import atomic_write
-from .logic import VALID_METHODS, button_message_ref
+from .logic import VALID_METHODS, button_message_ref, click_steps, infer_method
 
 CONFIG_PATH = BASE_DIR / "config.yaml"
-_DEVICES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+_DEVICES = {"CON", "CONIN$", "CONOUT$", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
 def safe_name(name):
@@ -22,6 +22,12 @@ def safe_name(name):
 
 def _words(value):
     return isinstance(value, list) and all(isinstance(word, str) and word.strip() for word in value)
+
+
+def _has_text(value):
+    if isinstance(value, str):
+        return bool(value.strip())
+    return isinstance(value, list) and bool(value) and all(isinstance(w, str) and w.strip() for w in value)
 
 
 def _range(value):
@@ -53,7 +59,7 @@ def validate_config(cfg):
         if not isinstance(schedule.get('timezone', 'Asia/Hong_Kong'), str):
             raise ValueError()
         ZoneInfo(schedule.get('timezone', 'Asia/Hong_Kong'))
-    except (ValueError, ZoneInfoNotFoundError):
+    except (ValueError, ZoneInfoNotFoundError, OSError, KeyError):
         return '时区无效，请使用 Asia/Hong_Kong 等 IANA 时区；Windows 请安装 tzdata'
     selected = schedule.get('accounts', [])
     if not isinstance(selected, list) or any(not isinstance(name, str) for name in selected) or len(set(selected)) != len(selected):
@@ -143,23 +149,28 @@ def validate_config(cfg):
                     value = action.get(key)
                     if value is not None and not isinstance(value, str) and not _words(value):
                         return f"动作的 {key} 必须是字符串或字符串数组"
-                if method in ("image_text", "image_only") and not action.get("image"):
+                eff_method = method or infer_method(action)
+                if eff_method in ("image_text", "image_only") and not _has_text(action.get("image")):
                     return "图片签到必须配置图片路径"
-                if method == "command_button" and not action.get("click_button"):
+                if eff_method == "image_text" and not _has_text(action.get("message")):
+                    return "图片＋文字签到必须配置说明文字"
+                if eff_method == "command_button" and not click_steps(action):
                     return "口令＋按钮签到必须配置按钮文字"
-                if method in ("command", "command_button") and not action.get("message"):
+                if eff_method in ("command", "command_button") and not _has_text(action.get("message")):
                     return "口令签到必须配置口令"
-                if method == "button_only":
+                if eff_method == "text" and "message" in action and action.get("message") is not None and not _has_text(action.get("message")):
+                    return "文字签到消息不能为空"
+                if eff_method == "button_only":
                     label = action.get("click_button")
-                    if not isinstance(label, str) or not label.strip() or len(label.splitlines()) != 1:
+                    if not isinstance(label, str) or not label.strip() or any(c in label for c in ("\r", "\n")):
                         return "仅按钮签到必须填写一个按钮的完整文字"
                     reference = action.get("button_message")
-                    if reference:
+                    if reference is not None and reference != "":
                         try:
                             button_message_ref(reference)
                         except ValueError as error:
                             return str(error)
-                    elif str(group.get("chat", "")).lstrip("#").startswith("-"):
+                    elif chat.startswith("-"):
                         return "群聊的仅按钮签到需要指定消息链接或数字消息 ID"
     return None
 

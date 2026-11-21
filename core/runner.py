@@ -1,6 +1,7 @@
 """Manual, cancellable check-in rounds with per-action evidence and reliable failures."""
 import asyncio
 import copy
+import inspect
 import json
 import logging
 import random
@@ -76,14 +77,14 @@ def share_result_to_members(state, name, today, system, members, winner_chat):
                   'shared_from': {'chat': str(winner_chat), 'name': winner_name},
                   'replies': [f'共用系统「{system}」已由「{winner_name}」完成签到', *winner.get('replies', [])],
                   'evidence': winner.get('evidence', [])}
-        record_last(state, name, chat, result, mark_date=today)
+        record_last(state, name, chat, result, mark_date=today, today=today)
         append_history(name, result)
         CAPTURE['items'].append({'account': name, **result})
         shared[chat] = result
     return shared
 
 
-def _result(group, actions, engine=None, error=None):
+def _result(group, actions, engine=None, error=None, cfg=None):
     merged = merge_action_results(actions) if actions else {'ok': False, 'clicked': False, 'with_image': False, 'error': None}
     confirms = [action.get('confirm', 'unconfirmed') for action in actions]
     confirm = 'failed' if error or not merged['ok'] else ('failed' if 'failed' in confirms else 'unconfirmed' if 'unconfirmed' in confirms else 'success')
@@ -106,7 +107,7 @@ def _result(group, actions, engine=None, error=None):
             'draft_warning': draft_warning,
             'source': source, 'replies': trusted, 'raw_replies': replies, 'evidence': evidence,
             'actions': _jsonable(actions),
-            'result_text': '' if actual_error else pick_result_reply(group, {}, trusted, confirm) or warning or (waiting if sent else ''),
+            'result_text': '' if actual_error else pick_result_reply(group, cfg or {}, trusted, confirm) or warning or (waiting if sent else ''),
             'expected_peer': getattr(engine, '_expected_peer', None),
             'actual_peer': getattr(engine, '_last_actual_peer', None)}
 
@@ -114,19 +115,39 @@ def _result(group, actions, engine=None, error=None):
 def _store(state, name, group, result, today, history=True):
     # An unconfirmed send is remembered to prevent accidental duplicate sends.
     mark_date = today if result['confirm'] == 'success' or result.get('sent') else None
-    record_last(state, name, result['chat'], result, mark_date=mark_date)
+    record_last(state, name, result['chat'], result, mark_date=mark_date, today=today)
     if history:
         append_history(name, result)
     log.info('[%s] %s：%s%s', name, result['name'], status_of(result), f'，{result["error"]}' if result.get('error') else '')
 
 
-async def _send_group_actions(engine, state, name, group, cfg, lo, hi):
+async def _send_group_actions(engine, state, name, group, cfg, lo, hi, today=None):
     engine.last_draft_warning = None
+    today = today or f'{local_now():%Y-%m-%d}'
+    configured_actions = group_actions(group)
+    all_button_only = bool(configured_actions) and all((a.get('method') or infer_method(a)) == 'button_only' for a in configured_actions)
     _progress(name, '打开会话', group)
-    await engine.open_chat(str(group['chat']), group.get('title'), group.get('topic'), group.get('folder'), group.get('topic_id'))
+    open_kwargs = {'require_composer': False} if all_button_only and 'require_composer' in inspect.signature(engine.open_chat).parameters else {}
+    await engine.open_chat(str(group['chat']), group.get('title'), group.get('topic'), group.get('folder'), group.get('topic_id'), **open_kwargs)
     await engine.assert_destination()
-    async with engine.preserve_draft():
-        outcome = await _execute_group_actions(engine, state, name, group, cfg, lo, hi)
+    cancelled_holder = {}
+    if all_button_only:
+        try:
+            return await _execute_group_actions(engine, state, name, group, cfg, lo, hi, today=today, cancelled_holder=cancelled_holder)
+        except asyncio.CancelledError:
+            if 'result' in cancelled_holder:
+                _store(state, name, group, cancelled_holder['result'], today)
+            raise
+    try:
+        async with engine.preserve_draft():
+            outcome = await _execute_group_actions(engine, state, name, group, cfg, lo, hi, today=today, cancelled_holder=cancelled_holder)
+    except asyncio.CancelledError:
+        if 'result' in cancelled_holder:
+            cancelled_result = cancelled_holder['result']
+            if engine.last_draft_warning:
+                cancelled_result['draft_warning'] = '；'.join(filter(None, (cancelled_result.get('draft_warning'), engine.last_draft_warning)))
+            _store(state, name, group, cancelled_result, today)
+        raise
     if engine.last_draft_warning and outcome[1]:
         outcome[1][-1]['draft_warning'] = engine.last_draft_warning
     return outcome
@@ -138,12 +159,13 @@ async def _wait_until(deadline):
         await asyncio.sleep(remaining)
 
 
-async def _watch_feedback(engine, boundary, group, cfg, *, sent_mids, started_at=None):
+async def _watch_feedback(engine, boundary, group, cfg, *, sent_mids, started_at=None, **extra):
     return await engine.watch_new_incoming(
         boundary, float(cfg.get('reply_wait_seconds', 6)),
         group.get('reply_mode') or cfg.get('reply_mode') or 'reply_only',
         sent_mids=sent_mids, started_at=started_at,
-        is_complete=lambda trusted: judge_replies(group, cfg, trusted, trusted) != 'unconfirmed')
+        is_complete=lambda trusted: judge_replies(group, cfg, trusted, trusted) != 'unconfirmed',
+        **extra)
 
 
 def _judge_action(group, cfg, action):
@@ -151,8 +173,9 @@ def _judge_action(group, cfg, action):
     return 'unconfirmed' if confirm == 'success' and action.get('buttons_complete') is False else confirm
 
 
-async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
+async def _execute_group_actions(engine, state, name, group, cfg, lo, hi, today=None, cancelled_holder=None):
     """Each required action has its own boundary, sent IDs, confirmation and error."""
+    today = today or f'{local_now():%Y-%m-%d}'
     info = await engine.opened_chat_info()
     title = clean_title(info.get('title'))
     if len(title) >= 2 and not group.get('topic'):
@@ -178,11 +201,11 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
             pending = copy.deepcopy(action)
             if not known_sent:
                 pending.update(sent=None, warning='操作结果待核对；若进程中断，请先检查 Telegram，避免重复签到' if button_only else '发送请求待核对；若进程中断，请先检查 Telegram，不要直接重发')
-            result = _result(group, [*actions, pending], engine)
+            result = _result(group, [*actions, pending], engine, cfg=cfg)
             result.update(confirm='unconfirmed', stage='awaiting_confirmation',
                           sent=True if known_sent or any(a.get('sent') for a in actions) else None,
                           result_text=('已点击按钮，等待反馈' if button_only else '消息已发出，等待完成签到动作与反馈') if known_sent else pending['warning'])
-            record_last(state, name, str(group['chat']), result, mark_date=f'{local_now():%Y-%m-%d}')
+            record_last(state, name, str(group['chat']), result, mark_date=today, today=today)
         async def before_dispatch():
             nonlocal dispatch_prepared
             checkpoint()
@@ -226,11 +249,32 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
             action['sent_mids'] = sorted(engine._active_mids)
             checkpoint(known_sent=True)
             _progress(name, '等待反馈', group, action=index, sent_at=group_sent_at)
-            popup = await engine.read_button_popup(float(cfg.get('reply_wait_seconds', 6))) if button_only else ''
-            if popup:
-                action.update(replies=[popup], trusted_replies=[popup], evidence=[
-                    {'source':'button_popup', 't':popup, 'mid':action['button_mid'], 'ts':time.time()}
-                ])
+            if button_only:
+                watch_sig = inspect.signature(engine.watch_new_incoming).parameters
+                if 'check_popup' in watch_sig:
+                    watch_extra = {
+                        'check_popup': True,
+                        'watch_button_mid': action.get('button_mid'),
+                        'button_initial_text': getattr(engine, '_last_button_initial_text', None),
+                    }
+                    action['replies'] = await _watch_feedback(
+                        engine, boundary, group, cfg, sent_mids=action['sent_mids'],
+                        started_at=getattr(engine, 'send_started_monotonic', None), **watch_extra,
+                    )
+                    action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
+                    action['trusted_replies'] = list(engine.last_replied)
+                    action['evidence'] = list(engine.last_evidence)
+                else:
+                    popup = await engine.read_button_popup(float(cfg.get('reply_wait_seconds', 6)))
+                    if popup:
+                        action.update(replies=[popup], trusted_replies=[popup], evidence=[
+                            {'source': 'button_popup', 't': popup, 'mid': action['button_mid'], 'ts': time.time()}
+                        ])
+                    else:
+                        action['replies'] = await _watch_feedback(engine, boundary, group, cfg, sent_mids=action['sent_mids'], started_at=getattr(engine, 'send_started_monotonic', None))
+                        action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
+                        action['trusted_replies'] = list(engine.last_replied)
+                        action['evidence'] = list(engine.last_evidence)
             else:
                 action['replies'] = await _watch_feedback(engine, boundary, group, cfg, sent_mids=action['sent_mids'], started_at=getattr(engine, 'send_started_monotonic', None))
                 action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
@@ -239,15 +283,18 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
             action['confirm'] = _judge_action(group, cfg, action)
         except asyncio.CancelledError:
             action['error'] = '用户取消任务；如已发出，请先核对反馈，不要重复发送'
-            unsettled = dispatch_prepared or action['sent']
+            unsettled = dispatch_prepared or action['sent'] or any(a.get('sent') for a in actions)
             action['confirm'] = 'unconfirmed' if unsettled else 'failed'
             if dispatch_prepared and not action['sent']:
                 action.update(sent=None, warning='发送结果待核对，请先检查 Telegram，不要直接重发')
             actions.append(action)
-            result = _result(group, actions, engine, action['error'])
+            result = _result(group, actions, engine, action['error'], cfg=cfg)
             if unsettled:
                 result.update(confirm='unconfirmed', stage='awaiting_confirmation', sent=True if any(a.get('sent') for a in actions) else None)
-            _store(state, name, group, result, f'{local_now():%Y-%m-%d}')
+            if cancelled_holder is not None:
+                cancelled_holder['result'] = result
+            else:
+                _store(state, name, group, result, today)
             raise
         except Exception as error:
             action['sent'] = action['sent'] or bool(getattr(error, 'sent', False))
@@ -262,7 +309,9 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
                 action['sent_mids'] = sorted(engine.last_sent_mids - before)
                 # Keep the observer alive even when a bot deleted the outgoing bubble too soon.
                 try:
-                    action['replies'] = await _watch_feedback(engine, boundary, group, cfg, sent_mids=action['sent_mids'], started_at=getattr(engine, 'send_started_monotonic', None))
+                    watch_sig = inspect.signature(engine.watch_new_incoming).parameters
+                    watch_extra = {'check_popup': True, 'watch_button_mid': action.get('button_mid'), 'button_initial_text': getattr(engine, '_last_button_initial_text', None)} if (button_only and 'check_popup' in watch_sig) else {}
+                    action['replies'] = await _watch_feedback(engine, boundary, group, cfg, sent_mids=action['sent_mids'], started_at=getattr(engine, 'send_started_monotonic', None), **watch_extra)
                     action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
                     action['trusted_replies'] = list(engine.last_replied)
                     action['evidence'] = list(engine.last_evidence)
@@ -272,7 +321,11 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi):
                 except asyncio.CancelledError:
                     action.update(error='用户取消反馈核对；发送状态待核对', confirm='unconfirmed')
                     actions.append(action)
-                    _store(state, name, group, _result(group, actions, engine), f'{local_now():%Y-%m-%d}')
+                    cancelled_result = _result(group, actions, engine, cfg=cfg)
+                    if cancelled_holder is not None:
+                        cancelled_holder['result'] = cancelled_result
+                    else:
+                        _store(state, name, group, cancelled_result, today)
                     raise
                 except Exception as feedback_error:
                     action['warning'] += f'；反馈采集未完成：{feedback_error}'
@@ -320,7 +373,7 @@ async def _recheck(engine, group, result, cfg):
             action['sent_mids'] = recovered['sent_mids']
             if recovered['sent_mids']:
                 action['id_recovery'] = recovered
-        if not action.get('sent_mids'):
+        if not action.get('sent_mids') and not str((action.get('boundary') or {}).get('peer', '')).isdigit():
             continue
         engine.last_sent_mids.update(action['sent_mids'])
         replies = await _watch_feedback(engine, action['boundary'], group, cfg, sent_mids=action['sent_mids'])
@@ -334,14 +387,37 @@ async def _recheck(engine, group, result, cfg):
         if action.get('ok') and action['confirm'] != 'unconfirmed':
             action['error'] = None
             action.pop('warning', None)
-    return _result(group, result['actions'], engine)
+    return _result(group, result['actions'], engine, cfg=cfg)
+
+
+def _blocked_systems(members, state, name, today):
+    blocked = set()
+    last_acc = state.get('_last', {}).get(name, {})
+    done_acc = state.get(name, {})
+    for group in members:
+        system = group.get('share_group')
+        if not system:
+            continue
+        chat = str(group['chat'])
+        prev = last_acc.get(chat, {})
+        if done_acc.get(chat) == today:
+            blocked.add(system)
+        elif isinstance(prev, dict) and prev.get('date') == today and (prev.get('confirm') in ('success', 'unconfirmed') or prev.get('sent') is not False):
+            blocked.add(system)
+    return blocked
 
 
 async def _web_account_worker(account, cfg, state, today, lo, hi, wait_seconds, chats, recheck=False):
     from web_engine import WebEngine
     name = account['name']
     members = account.get('groups', [])
-    selected = [group for group in members if (str(group['chat']) in chats if chats is not None else state.get(name, {}).get(str(group['chat'])) != today)]
+    blocked = set() if (chats is not None or recheck) else _blocked_systems(members, state, name, today)
+    selected = [
+        group for group in members
+        if (str(group['chat']) in chats if chats is not None else (
+            state.get(name, {}).get(str(group['chat'])) != today and group.get('share_group') not in blocked
+        ))
+    ]
     if not selected:
         return {}
     engine = WebEngine(account, cfg)
@@ -354,17 +430,27 @@ async def _web_account_worker(account, cfg, state, today, lo, hi, wait_seconds, 
             for group in selected:
                 previous = state.get('_last', {}).get(name, {}).get(str(group['chat']), {})
                 if not recheck_eligible(previous, today):
-                    raise ValueError('旧结果缺少可靠发送边界，无法安全补查；请先在 Telegram 核对')
+                    prev_actions = previous.get('actions') or []
+                    result = _result(group, prev_actions, engine, cfg=cfg)
+                    result.update(error='旧结果缺少可靠发送边界，无法安全补查；请先在 Telegram 核对', stage='recheck_failed')
+                    results[result['chat']] = (group, result)
+                    continue
                 _progress(name, '仅补查反馈', group)
                 try:
                     result = await _recheck(engine, group, {'actions': previous['actions']}, cfg)
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
-                    result = _result(group, previous['actions'], engine)
+                    result = _result(group, previous['actions'], engine, cfg=cfg)
                     result.update(error=f'补查未完成：{error}', stage='recheck_failed')
                 results[result['chat']] = (group, result)
                 _store(state, name, group, result, today)
+                if result['confirm'] == 'success' and group.get('share_group'):
+                    all_members = [g for g in members if g.get('share_group') == group['share_group']]
+                    shared = share_result_to_members(state, name, today, group['share_group'], all_members, result['chat'])
+                    for chat, shared_result in shared.items():
+                        if chat in results:
+                            results[chat] = (results[chat][0], shared_result)
         else:
             solo, chains = [], {}
             for group in selected:
@@ -376,14 +462,14 @@ async def _web_account_worker(account, cfg, state, today, lo, hi, wait_seconds, 
             for system, groups in work:
                 for group in groups:
                     try:
-                        _, actions, _, _ = await _send_group_actions(engine, state, name, group, cfg, lo, hi)
-                        result = _result(group, actions, engine)
+                        _, actions, _, _ = await _send_group_actions(engine, state, name, group, cfg, lo, hi, today=today)
+                        result = _result(group, actions, engine, cfg=cfg)
                     except asyncio.CancelledError:
                         raise
                     except Exception as error:
-                        result = _result(group, [], engine, error)
+                        result = _result(group, [], engine, error, cfg=cfg)
                     results[result['chat']] = (group, result)
-                    needs_check = result['confirm'] == 'unconfirmed' and cfg.get('reply_second_pass') and any(a.get('sent_mids') for a in result['actions'])
+                    needs_check = result['confirm'] == 'unconfirmed' and cfg.get('reply_second_pass') and recheck_eligible(result)
                     _store(state, name, group, result, today, history=not needs_check)
                     if needs_check:
                         pending.append((group, result))
@@ -395,8 +481,8 @@ async def _web_account_worker(account, cfg, state, today, lo, hi, wait_seconds, 
                             if chat in results and chat in shared:
                                 results[chat] = (item, shared[chat])
                         break
-                    # A sent but unconfirmed command must not fan out into more sends.
-                    if system and result['confirm'] == 'unconfirmed':
+                    # A sent or uncertain command must not fan out into more sends.
+                    if system and (result['confirm'] == 'unconfirmed' or result.get('sent') is not False):
                         break
             for group, result in pending:
                 _progress(name, '补查反馈', group)
@@ -414,7 +500,7 @@ async def _web_account_worker(account, cfg, state, today, lo, hi, wait_seconds, 
                     raise
                 except Exception as error:
                     result['recheck_error'] = str(error)
-                    record_last(state, name, result['chat'], result)
+                    record_last(state, name, result['chat'], result, today=today)
                     append_history(name, result)
     except asyncio.CancelledError:
         _progress(name, '已取消')
@@ -423,11 +509,14 @@ async def _web_account_worker(account, cfg, state, today, lo, hi, wait_seconds, 
         # Startup, login and unexpected worker failures are visible for every affected target.
         for group in selected:
             if str(group['chat']) not in results:
-                result = _result(group, [], engine, error)
+                result = _result(group, [], engine, error, cfg=cfg)
                 results[result['chat']] = (group, result)
                 _store(state, name, group, result, today)
     finally:
-        await engine.close()
+        try:
+            await engine.close()
+        except Exception:
+            log.exception('[%s] 关闭浏览器失败', name)
     for group, result in results.values():
         CAPTURE['items'].append({'account': name, **result})
     _progress(name, '已完成')
@@ -455,7 +544,13 @@ async def run_web_round(cfg, state, only=None, chats=None, chats_by_account=None
             if accounts and account['name'] not in accounts:
                 continue
             selected = (chats_by_account or {}).get(account['name'], chats)
-            todo = any((str(g['chat']) in selected if selected is not None else state.get(account['name'], {}).get(str(g['chat'])) != today) for g in account.get('groups', []))
+            blocked = set() if (selected is not None or recheck) else _blocked_systems(account.get('groups', []), state, account['name'], today)
+            todo = any(
+                (str(g['chat']) in selected if selected is not None else (
+                    state.get(account['name'], {}).get(str(g['chat'])) != today and g.get('share_group') not in blocked
+                ))
+                for g in account.get('groups', [])
+            )
             if not todo:
                 continue
             if tasks and delay_hi:
@@ -463,10 +558,20 @@ async def run_web_round(cfg, state, only=None, chats=None, chats_by_account=None
             tasks.append(asyncio.create_task(_web_account_worker(account, cfg, state, today, lo, hi, wait, selected, recheck)))
             if delay_hi:
                 await asyncio.sleep(0)  # Start this worker before timing the next account's interval.
-        outcomes = await asyncio.gather(*tasks)
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         retries = {}
+        first_error = None
         for outcome in outcomes:
-            retries.update(outcome)
+            if isinstance(outcome, BaseException):
+                if isinstance(outcome, asyncio.CancelledError):
+                    raise outcome
+                if first_error is None:
+                    first_error = outcome
+                log.exception('账号任务异常', exc_info=outcome)
+            else:
+                retries.update(outcome)
+        if first_error is not None:
+            raise first_error
         return retries
     finally:
         for task in tasks:
@@ -497,7 +602,9 @@ async def _probe_account(account, cfg, chats=None):
                 continue
             _progress(account['name'], '只读体检', group)
             PROBE['progress'] = ACTIVITY['act']
-            result['chats'].append(await engine.probe_chat(str(group['chat']), group.get('title'), group.get('topic'), group.get('folder'), infer_method(group), group.get('topic_id')))
+            actions = group_actions(group)
+            probe_method = 'button_only' if actions and all((a.get('method') or infer_method(a)) == 'button_only' for a in actions) else infer_method(group)
+            result['chats'].append(await engine.probe_chat(str(group['chat']), group.get('title'), group.get('topic'), group.get('folder'), probe_method, group.get('topic_id')))
     except asyncio.CancelledError:
         result['error'] = '用户取消体检'
         raise
@@ -510,6 +617,8 @@ async def _probe_account(account, cfg, chats=None):
 
 
 async def run_probe_round(cfg, only=None, chats=None):
+    lock = FileLock(BASE_DIR / 'data' / 'locks' / 'round.lock').acquire()
+    zone_token = set_timezone(cfg)
     ACTIVITY.update(act='', accounts={})
     PROBE.update(running=True, progress='准备体检', result=None, started=f'{local_now():%Y-%m-%d %H:%M:%S}')
     try:
@@ -521,3 +630,5 @@ async def run_probe_round(cfg, only=None, chats=None):
     finally:
         PROBE.update(running=False, progress='')
         ACTIVITY['act'] = ''
+        lock.release()
+        reset_timezone(zone_token)

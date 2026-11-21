@@ -22,7 +22,7 @@ import yaml
 from flask import Flask, Response, jsonify, request
 
 from core import BASE_DIR
-from core.paths import RESOURCE_DIR, login_command, visible_browser_available
+from core.paths import RESOURCE_DIR, account_lock_path, login_command, visible_browser_available
 from core.config import CONFIG_PATH, load_config, safe_name, save_config, validate_config
 from core.history import HISTORY_DIR
 from core.locks import FileLock
@@ -46,6 +46,18 @@ TRIGGER = {'event': threading.Event(), 'only': None, 'chats': None, 'mode': 'che
 _lock = threading.RLock()
 _test_push_lock = threading.Lock()
 SCHEDULER = None
+_RUNTIME_LISTEN = {'host': None, 'token': ''}
+
+
+class _LoopNotReadyError(RuntimeError):
+    pass
+
+
+def _safe_now(cfg=None):
+    try:
+        return local_now(cfg if cfg is not None else read_cfg())
+    except Exception:
+        return local_now()
 
 
 def read_cfg():
@@ -78,9 +90,11 @@ def _busy_msg():
 def _refresh_login():
     process = BOT.get('login_process')
     if process is not None and process.poll() is not None:
-        BOT['job'].update(status='completed' if process.returncode == 0 else 'failed',
-                          error='' if process.returncode == 0 else '登录未完成，请重试扫码', ended=f'{local_now(read_cfg()):%H:%M:%S}')
-        BOT.update(busy=False, login_process=None)
+        returncode = process.returncode
+        BOT.update(busy=False, scanning=False, login_process=None)
+        if BOT.get('job'):
+            BOT['job'].update(status='completed' if returncode == 0 else 'failed',
+                              error='' if returncode == 0 else '登录未完成，请重试扫码', ended=f'{_safe_now():%H:%M:%S}')
 
 
 def _reserve(mode, scanning=False, show_browser=True):
@@ -91,7 +105,7 @@ def _reserve(mode, scanning=False, show_browser=True):
         raise ValueError('当前服务器没有可视桌面，请在服务器桌面或 X11 转发环境中完成首次扫码登录')
     show_browser = show_browser and visible_browser_available()
     job = {'id': uuid.uuid4().hex, 'mode': mode, 'status': 'queued',
-           'created': local_now(read_cfg()).isoformat(timespec='seconds'), 'error': '', 'retry_map': {},
+           'created': _safe_now().isoformat(timespec='seconds'), 'error': '', 'retry_map': {},
            'show_browser': show_browser}
     ACTIVITY.update(act='', accounts={})
     BOT.update(busy=True, scanning=scanning, job=job, cancel_requested=False)
@@ -100,13 +114,14 @@ def _reserve(mode, scanning=False, show_browser=True):
 
 def _release(job_id, status='completed', error=''):
     with _lock:
-        if BOT['job'] and BOT['job']['id'] == job_id:
-            BOT['job'].update(status=status, error=error, ended=f'{local_now(read_cfg()):%H:%M:%S}')
+        job = BOT.get('job')
+        if job and job['id'] == job_id and (BOT['busy'] or job.get('status') in ('queued', 'running', 'cancelling')):
             BOT.update(busy=False, scanning=False, task=None)
-            if BOT['job'].get('scheduled'):
+            job.update(status=status, error=error, ended=f'{_safe_now():%H:%M:%S}')
+            if job.get('scheduled'):
                 try:
                     scheduler.complete(job_id, status, error, read_cfg())
-                except (RuntimeError, OSError):
+                except (RuntimeError, OSError, ValueError):
                     log.exception('无法保存定时任务结束状态，请核对后再操作')
 
 
@@ -119,18 +134,22 @@ async def _submit_scheduled(cfg, current):
             round_lock = FileLock(BASE_DIR / 'data' / 'locks' / 'round.lock').acquire()
         except RuntimeError:
             return False
+        job_id = None
         try:
-            job_id = _reserve('checkin', show_browser=not cfg.get('schedule', {}).get('headless', True))
+            schedule = cfg.get('schedule') if isinstance(cfg.get('schedule'), dict) else {}
+            job_id = _reserve('checkin', show_browser=not schedule.get('headless', True))
             BOT['job']['scheduled'] = True
             if not scheduler.claim(cfg, job_id, current):
                 BOT['job']['scheduled'] = False
                 _release(job_id, 'cancelled')
                 return False
-            TRIGGER.update(only=None, chats=None, mode='checkin', scheduled_accounts=cfg.get('schedule', {}).get('accounts', []))
+            TRIGGER.update(only=None, chats=None, mode='checkin', scheduled_accounts=schedule.get('accounts', []))
             TRIGGER['event'].set()
         except BaseException:
-            BOT['job']['scheduled'] = False
-            _release(job_id, 'failed', '定时任务未能持久化，未执行')
+            if job_id is not None:
+                if BOT.get('job') and BOT['job'].get('id') == job_id:
+                    BOT['job']['scheduled'] = False
+                _release(job_id, 'failed', '定时任务未能持久化，未执行')
             raise
         finally:
             round_lock.release()
@@ -140,7 +159,7 @@ async def _submit_scheduled(cfg, current):
 def call(coro, timeout=240):
     if not BOT['loop'] or not BOT['loop'].is_running():
         coro.close()
-        raise RuntimeError('后台尚未就绪，请稍后重试')
+        raise _LoopNotReadyError('后台尚未就绪，请稍后重试')
     future = asyncio.run_coroutine_threadsafe(coro, BOT['loop'])
     try:
         return future.result(timeout=timeout)
@@ -160,15 +179,18 @@ async def bot_loop():
                 continue
             only, chats, mode = TRIGGER['only'], TRIGGER['chats'], TRIGGER['mode']
             job_id = BOT['job']['id']
+            scheduled = bool(BOT['job'].get('scheduled'))
+            scheduled_accounts = list(TRIGGER.get('scheduled_accounts') or []) if scheduled else []
             TRIGGER['event'].clear()
             BOT['job']['status'] = 'running'
+        source = '每日定时签到' if scheduled else '手动签到'
         cfg = None
-        scheduled_accounts = []
+        round_date = None
         try:
             cfg = load_config()
-            if BOT['job'].get('scheduled'):
+            round_date = f'{local_now(cfg):%Y-%m-%d}'
+            if scheduled:
                 scheduler.complete(job_id, 'running', cfg=cfg)
-            scheduled_accounts = (TRIGGER.get('scheduled_accounts') or []) if BOT['job'].get('scheduled') else []
             # Manual tasks explicitly choose a visible browser; never inherit an audit's mode.
             cfg['web_headless'] = not BOT['job']['show_browser']
             BOT['cfg_error'] = None
@@ -180,19 +202,26 @@ async def bot_loop():
                     task.cancel()
             result = await task
             if mode != 'probe':
-                BOT['job']['retry_map'] = result
+                with _lock:
+                    BOT['job']['retry_map'] = result
             if mode == 'checkin':
-                BOT['job']['notification'] = await _notify_job(cfg, only=only, chats=chats, accounts=scheduled_accounts, source='每日定时签到' if BOT['job'].get('scheduled') else '手动签到')
+                notification = await _notify_job(cfg, only=only, chats=chats, accounts=scheduled_accounts, source=source, today=round_date)
+                with _lock:
+                    BOT['job']['notification'] = notification
             _release(job_id)
         except asyncio.CancelledError:
-            if cfg is not None and mode == 'checkin':
-                BOT['job']['notification'] = await _notify_job(cfg, only=only, chats=chats, accounts=scheduled_accounts, cancelled=True)
+            if cfg is not None and mode == 'checkin' and not BOT.get('stopping'):
+                notification = await _notify_job(cfg, only=only, chats=chats, accounts=scheduled_accounts, cancelled=True, source=source, today=round_date)
+                with _lock:
+                    BOT['job']['notification'] = notification
             _release(job_id, 'cancelled')
         except (Exception, SystemExit) as error:
             BOT['cfg_error'] = str(error) if isinstance(error, SystemExit) else None
             log.exception('任务执行失败')
             if cfg is not None and mode == 'checkin':
-                BOT['job']['notification'] = await _notify_job(cfg, only=only, chats=chats, accounts=scheduled_accounts, error=str(error))
+                notification = await _notify_job(cfg, only=only, chats=chats, accounts=scheduled_accounts, error=str(error), source=source, today=round_date)
+                with _lock:
+                    BOT['job']['notification'] = notification
             _release(job_id, 'failed', str(error))
 
 
@@ -263,9 +292,17 @@ def api_status():
                            'can_recheck': recheck_eligible(latest, today)})
         accounts.append({'name': account['name'], 'status': '上次已登录' if WebEngine(account, cfg).marker().exists() else '待扫码',
                          'done': sum(g['confirm'] == 'success' for g in groups), 'total': len(groups), 'groups': groups})
-    return jsonify(accounts=accounts, today=today, busy=BOT['busy'], activity=ACTIVITY['act'],
+    with _lock:
+        _refresh_login()
+        busy = BOT['busy']
+        job_snapshot = copy.deepcopy(BOT['job'])
+        cfg_error = BOT['cfg_error']
+        activity_act = ACTIVITY.get('act', '')
+        progress_snapshot = copy.deepcopy(ACTIVITY.get('accounts', {}))
+        probe_snapshot = copy.deepcopy(PROBE)
+    return jsonify(accounts=accounts, today=today, busy=busy, activity=activity_act,
                    browser={'visible_available': visible_browser_available()}, server_time=local_now(cfg).timestamp(),
-                   progress=ACTIVITY.get('accounts', {}), job=BOT['job'], cfg_error=BOT['cfg_error'], probe=PROBE,
+                   progress=progress_snapshot, job=job_snapshot, cfg_error=cfg_error, probe=probe_snapshot,
                    automation={**scheduler.describe(cfg), 'active': bool(SCHEDULER and SCHEDULER.active),
                                'service_error': SCHEDULER.error if SCHEDULER else ''}, notification=notifications.last_status())
 
@@ -291,6 +328,7 @@ def api_automation_save():
     if key and data.get('clear_sendkey'):
         raise ValueError('不能同时替换和删除 SendKey')
     with _lock, FileLock(BASE_DIR / 'data' / 'locks' / 'round.lock'):
+        _refresh_login()
         if BOT['busy']:
             raise RuntimeError(_busy_msg())
         cfg = read_cfg()
@@ -300,16 +338,22 @@ def api_automation_save():
         if error:
             raise ValueError(error)
         key_change = bool(key or data.get('clear_sendkey'))
-        previous_key = notifications.saved_key() if key_change else None
+        previous_secret_raw = notifications.SECRETS_PATH.read_text(encoding='utf-8') if key_change and notifications.SECRETS_PATH.exists() else None
         try:
             if key_change:
                 notifications.save_key(key)
-            if cfg.get('notifications', {}).get('enabled') and not notifications.key_status()['configured']:
+            if (cfg.get('notifications') or {}).get('enabled') and not notifications.key_status()['configured']:
                 raise ValueError('启用微信推送前请先保存有效 SendKey')
             save_config(cfg)
         except BaseException:
             if key_change:
-                notifications.save_key(previous_key)
+                if previous_secret_raw is not None:
+                    atomic_write(notifications.SECRETS_PATH, previous_secret_raw)
+                elif notifications.SECRETS_PATH.exists():
+                    try:
+                        notifications.SECRETS_PATH.unlink()
+                    except OSError:
+                        pass
             raise
     return api_automation_get()
 
@@ -337,7 +381,9 @@ def api_notification_test():
 @app.get('/api/config')
 def api_config_get():
     cfg = read_cfg()
-    return jsonify(**cfg, _revision=revision(cfg))
+    rev = revision(cfg)
+    public_cfg = {k: v for k, v in cfg.items() if k != 'gui_token'}
+    return jsonify(**public_cfg, _revision=rev)
 
 
 def _verify_revision(data, current):
@@ -353,12 +399,12 @@ def api_config_save():
         raise ValueError('配置必须是对象')
     cfg = copy.deepcopy(cfg)
     cfg.pop('_revision', None)
-    error = validate_config(cfg)
-    if error:
-        raise ValueError(error)
     renames = data.get('renames', {})
-    if not isinstance(renames, dict) or any(not isinstance(v, str) for v in renames.values()):
+    if not isinstance(renames, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in renames.items()):
         raise ValueError('renames 必须是账号名映射')
+    active_renames = {old: new for old, new in renames.items() if old != new}
+    if active_renames and isinstance(cfg.get('schedule'), dict) and isinstance(cfg['schedule'].get('accounts'), list):
+        cfg['schedule']['accounts'] = [active_renames.get(name, name) for name in cfg['schedule']['accounts']]
     from web_engine import PROFILES_DIR
     with _lock, FileLock(BASE_DIR / 'data' / 'locks' / 'round.lock'):
         _refresh_login()
@@ -366,46 +412,91 @@ def api_config_save():
             raise RuntimeError(_busy_msg())
         current = read_cfg()
         _verify_revision(data, current)
+        if 'gui_token' not in cfg and 'gui_token' in current:
+            cfg['gui_token'] = current['gui_token']
+        listen_host = _RUNTIME_LISTEN.get('host')
+        if (listen_host and listen_host not in ('127.0.0.1', 'localhost', '::1')
+                and not os.environ.get('CHECKIN_GUI_TOKEN', '').strip()
+                and not str(cfg.get('gui_token') or '').strip()):
+            raise ValueError('监听非本机地址时不能清空 gui_token')
+        error = validate_config(cfg)
+        if error:
+            raise ValueError(error)
         old_names = {a['name'] for a in current.get('accounts', [])}
         new_names = {a['name'] for a in cfg.get('accounts', [])}
+        for old, new in active_renames.items():
+            if old not in old_names or new not in new_names:
+                raise ValueError('改名映射中的账号不存在')
         state = load_state()
-        moved, locks = [], []
+        locks, staged_moves, final_moves = [], [], []
+        staging_dir = None
         original_state = copy.deepcopy(state)
         original_text = CONFIG_PATH.read_text(encoding='utf-8') if CONFIG_PATH.exists() else None
         config_written = False
         try:
-            for old, new in renames.items():
-                if old not in old_names or new not in new_names:
-                    raise ValueError('改名映射中的账号不存在')
-                if old == new:
-                    continue
-                old_profile, new_profile = safe_name(old), safe_name(new)
-                for profile in {old_profile.casefold(), new_profile.casefold()}:
-                    locks.append(FileLock(PROFILES_DIR.parent / 'locks' / (profile + '.lock')).acquire())
-                src, dst = PROFILES_DIR / old_profile, PROFILES_DIR / new_profile
-                if dst.exists() and src.resolve() != dst.resolve():
-                    raise RuntimeError('新账号名对应的登录会话已存在，请更换名称')
-                for source, target in [(src, dst), (PROFILES_DIR / (old_profile + '.loggedin'), PROFILES_DIR / (new_profile + '.loggedin'))]:
-                    if source.exists() and source != target:
-                        source.rename(target)
-                        moved.append((source, target))
-                if old in state:
-                    state[new] = state.pop(old)
+            if active_renames:
+                lock_names = sorted({safe_name(name).casefold() for pair in active_renames.items() for name in pair})
+                for key in lock_names:
+                    locks.append(FileLock(account_lock_path(PROFILES_DIR.parent.parent, key)).acquire())
+                moving_sources = {safe_name(old).casefold() for old in active_renames}
+                pairs = []
+                for old, new in active_renames.items():
+                    old_profile, new_profile = safe_name(old), safe_name(new)
+                    src, dst = PROFILES_DIR / old_profile, PROFILES_DIR / new_profile
+                    if dst.exists() and new_profile.casefold() not in moving_sources and src.resolve() != dst.resolve():
+                        raise RuntimeError('新账号名对应的登录会话已存在，请更换名称')
+                    pairs.append((old_profile, new_profile))
+                staging_root = PROFILES_DIR.parent / 'session-rename'
+                staging_dir = staging_root / uuid.uuid4().hex
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                for idx, (old_profile, new_profile) in enumerate(pairs):
+                    for suffix in ('', '.loggedin'):
+                        source = PROFILES_DIR / (old_profile + suffix)
+                        target = PROFILES_DIR / (new_profile + suffix)
+                        if source.exists() and source != target:
+                            temp = staging_dir / f'{idx}{suffix or ".dir"}'
+                            source.rename(temp)
+                            staged_moves.append((source, temp, target))
+                for source, temp, target in staged_moves:
+                    temp.rename(target)
+                    final_moves.append((source, target))
+                popped_top = {old: state.pop(old) for old in active_renames if old in state}
+                for old, val in popped_top.items():
+                    state[active_renames[old]] = val
                 for key in ('_last', '_chat_cache'):
-                    if old in state.get(key, {}):
-                        state[key][new] = state[key].pop(old)
+                    bucket = state.get(key)
+                    if isinstance(bucket, dict):
+                        popped = {old: bucket.pop(old) for old in active_renames if old in bucket}
+                        for old, val in popped.items():
+                            bucket[active_renames[old]] = val
             save_config(cfg)
             config_written = True
-            if renames:
+            if active_renames:
                 save_state(state)
         except BaseException:
-            for source, target in reversed(moved):
-                target.rename(source)
+            if final_moves:
+                rollback_dir = PROFILES_DIR.parent / 'session-rename' / ('rb-' + uuid.uuid4().hex)
+                rollback_dir.mkdir(parents=True, exist_ok=True)
+                rb_temp = []
+                for idx, (source, target) in enumerate(reversed(final_moves)):
+                    if target.exists():
+                        tmp = rollback_dir / str(idx)
+                        target.rename(tmp)
+                        rb_temp.append((source, tmp))
+                for source, tmp in rb_temp:
+                    tmp.rename(source)
+                shutil.rmtree(rollback_dir, ignore_errors=True)
+            else:
+                for source, temp, _ in reversed(staged_moves):
+                    if temp.exists():
+                        temp.rename(source)
             if config_written and original_text is not None:
                 atomic_write(CONFIG_PATH, original_text)
                 save_state(original_state)
             raise
         finally:
+            if staging_dir and staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
             for lock in locks:
                 lock.release()
     return jsonify(ok=True, warnings=[], revision=revision(cfg))
@@ -416,32 +507,32 @@ def _queue(mode):
     show_browser = data.get('show_browser', visible_browser_available())
     if not isinstance(show_browser, bool):
         raise ValueError('show_browser 必须是布尔值')
-    cfg = read_cfg()
-    error = validate_config(cfg)
-    if error:
-        raise ValueError(error)
     if data.get('account') is not None and not isinstance(data['account'], str):
         raise ValueError('account 必须是账号名字符串')
     if isinstance(data.get('account'), str) and not data['account'].strip():
         raise ValueError('指定账号不能为空；执行全部账号时请省略 account')
     account = data.get('account') or None
-    if account is not None and (not isinstance(account, str) or account not in {a['name'] for a in cfg.get('accounts', [])}):
-        raise ValueError('找不到指定账号')
     chats = data.get('chats')
     if chats is not None and (not isinstance(chats, list) or not chats or len(chats)>1000 or any(not isinstance(c, str) for c in chats)):
         raise ValueError('chats 必须是非空字符串数组，最多 1000 项')
-    chosen = [a for a in cfg.get('accounts', []) if not account or a['name'] == account]
-    if not any(a.get('groups') for a in chosen):
-        raise ValueError('没有可执行的签到会话，请先添加账号和群')
-    if chats and not set(chats).issubset({str(g['chat']) for a in chosen for g in a.get('groups', [])}):
-        raise ValueError('指定会话不在当前账号配置中')
-    if mode == 'recheck' and (not account or not chats):
-        raise ValueError('补查必须指定账号与会话')
-    if mode == 'recheck':
-        latest = load_state().get('_last', {}).get(account, {})
-        if any(not recheck_eligible(latest.get(chat, {}), f'{local_now(read_cfg()):%Y-%m-%d}') for chat in chats):
-            raise ValueError('只能补查今天且保留发送消息 ID 或可靠发送边界的结果；旧记录请先在 Telegram 核对')
     with _lock:
+        cfg = read_cfg()
+        error = validate_config(cfg)
+        if error:
+            raise ValueError(error)
+        if account is not None and account not in {a['name'] for a in cfg.get('accounts', [])}:
+            raise ValueError('找不到指定账号')
+        chosen = [a for a in cfg.get('accounts', []) if not account or a['name'] == account]
+        if not any(a.get('groups') for a in chosen):
+            raise ValueError('没有可执行的签到会话，请先添加账号和群')
+        if chats and not set(chats).issubset({str(g['chat']) for a in chosen for g in a.get('groups', [])}):
+            raise ValueError('指定会话不在当前账号配置中')
+        if mode == 'recheck' and (not account or not chats):
+            raise ValueError('补查必须指定账号与会话')
+        if mode == 'recheck':
+            latest = load_state().get('_last', {}).get(account, {})
+            if any(not recheck_eligible(latest.get(chat, {}), f'{local_now(cfg):%Y-%m-%d}') for chat in chats):
+                raise ValueError('只能补查今天且保留发送消息 ID 或可靠发送边界的结果；旧记录请先在 Telegram 核对')
         job_id = _reserve(mode, show_browser=show_browser)
         TRIGGER.update(only=account, chats=chats, mode=mode, scheduled_accounts=[])
         TRIGGER['event'].set()
@@ -486,9 +577,9 @@ def api_cancel():
 def api_web_login():
     data = body()
     account = data.get('account')
-    if not isinstance(account, str) or account not in {a['name'] for a in read_cfg().get('accounts', [])}:
-        raise ValueError('找不到指定账号，请先保存配置')
     with _lock:
+        if not isinstance(account, str) or account not in {a['name'] for a in read_cfg().get('accounts', [])}:
+            raise ValueError('找不到指定账号，请先保存配置')
         job_id = _reserve('login')
         try:
             process = subprocess.Popen(login_command(account),
@@ -525,9 +616,12 @@ def _scan(account_name, folder='', refresh=False, folders_only=False, topic_chat
         failed = None
         round_lock = None
         try:
+            with _lock:
+                BOT['task'] = asyncio.current_task()
+                if BOT['cancel_requested']:
+                    raise asyncio.CancelledError()
+                BOT['job']['status'] = 'running'
             round_lock = FileLock(BASE_DIR / 'data' / 'locks' / 'round.lock').acquire()
-            BOT['task'] = asyncio.current_task()
-            BOT['job']['status'] = 'running'
             await engine.launch()
             if topic_chat is not None:
                 result = await engine.list_topics(topic_chat, title, folder or None)
@@ -569,9 +663,8 @@ def _scan(account_name, folder='', refresh=False, folders_only=False, topic_chat
                 _release(job_id, 'failed' if failed else 'completed', str(failed or ''))
     try:
         return call(scan(), timeout=300)
-    except RuntimeError:
-        if not BOT['task']:
-            _release(job_id, 'failed', '后台尚未就绪')
+    except _LoopNotReadyError:
+        _release(job_id, 'failed', '后台尚未就绪')
         raise
 
 
@@ -605,7 +698,7 @@ def _session_paths(name):
 def _delete_session(name):
     from web_engine import PROFILES_DIR
     profile, marker = _session_paths(name)
-    with FileLock(PROFILES_DIR.parent / 'locks' / (safe_name(name) + '.lock')):
+    with FileLock(account_lock_path(PROFILES_DIR.parent.parent, safe_name(name))):
         if profile.exists():
             shutil.rmtree(profile)
         marker.unlink(missing_ok=True)
@@ -615,7 +708,8 @@ def _delete_session(name):
 def api_delete_session():
     data = body()
     name = data.get('account')
-    with _lock:
+    with _lock, FileLock(BASE_DIR / 'data' / 'locks' / 'round.lock'):
+        _refresh_login()
         if BOT['busy']:
             raise RuntimeError(_busy_msg())
         if not isinstance(name, str) or name not in {a['name'] for a in read_cfg().get('accounts', [])}:
@@ -629,6 +723,7 @@ def api_delete_account():
     data = body()
     name = data.get('account')
     with _lock, FileLock(BASE_DIR / 'data' / 'locks' / 'round.lock'):
+        _refresh_login()
         if BOT['busy']:
             raise RuntimeError(_busy_msg())
         cfg = read_cfg()
@@ -643,31 +738,47 @@ def api_delete_account():
         if trash.parent != trash_root:
             raise ValueError('删除暂存路径无效')
         staged = []
-        original_cfg = copy.deepcopy(cfg)
+        original_text = CONFIG_PATH.read_text(encoding='utf-8') if CONFIG_PATH.exists() else None
         state = load_state()
         original_state = copy.deepcopy(state)
         state.pop(name, None)
         for key in ('_last', '_chat_cache'):
-            state.get(key, {}).pop(name, None)
+            if isinstance(state.get(key), dict):
+                state[key].pop(name, None)
         warnings = []
-        with FileLock(PROFILES_DIR.parent / 'locks' / (safe_name(name) + '.lock')):
+        with FileLock(account_lock_path(PROFILES_DIR.parent.parent, safe_name(name))):
             trash.mkdir(parents=True)
             committed = False
+            config_written = False
             try:
+                cfg['accounts'] = [a for a in cfg['accounts'] if a['name'] != name]
+                if isinstance(cfg.get('schedule'), dict) and isinstance(cfg['schedule'].get('accounts'), list):
+                    cfg['schedule']['accounts'] = [acc for acc in cfg['schedule']['accounts'] if acc != name]
+                    if cfg['schedule'].get('enabled') and not any(
+                        a.get('groups') for a in cfg['accounts']
+                        if not cfg['schedule']['accounts'] or a['name'] in cfg['schedule']['accounts']
+                    ):
+                        cfg['schedule']['enabled'] = False
+                        warnings.append('已自动关闭定时计划（删除账号后已无定时签到会话）')
+                error = validate_config(cfg)
+                if error:
+                    raise ValueError(error)
                 for source in (profile, marker):
                     if source.exists():
                         target = trash / source.name
                         source.rename(target)
                         staged.append((source, target))
-                cfg['accounts'] = [a for a in cfg['accounts'] if a['name'] != name]
                 save_config(cfg)
+                config_written = True
                 save_state(state)
                 committed = True
             except BaseException:
                 for source, target in reversed(staged):
-                    target.rename(source)
-                atomic_write(CONFIG_PATH, yaml.safe_dump(original_cfg, allow_unicode=True, sort_keys=False))
-                save_state(original_state)
+                    if target.exists():
+                        target.rename(source)
+                if config_written and original_text is not None:
+                    atomic_write(CONFIG_PATH, original_text)
+                    save_state(original_state)
                 raise
             finally:
                 # trash is an exact generated child of the verified task-owned trash root.
@@ -730,10 +841,21 @@ def _history_rows():
     return sorted(rows, key=lambda row: row['time'], reverse=True)
 
 
+def _parse_int_arg(name, default, lo, hi):
+    raw = request.args.get(name)
+    if raw is None or raw == '':
+        return default
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f'参数 {name} 必须是整数') from error
+    return max(lo, min(hi, value))
+
+
 @app.get('/api/history')
 def api_history():
-    page = max(1, int(request.args.get('page', 1)))
-    limit = max(1, min(1000, int(request.args.get('limit', 100))))
+    page = _parse_int_arg('page', 1, 1, 100000)
+    limit = _parse_int_arg('limit', 100, 1, 1000)
     rows = _history_rows()
     counts = Counter(row['status'] for row in rows)
     return jsonify(ok=True, rows=rows[(page-1)*limit:page*limit], total=len(rows), counts=counts, page=page, limit=limit)
@@ -745,18 +867,23 @@ def api_history_download():
     writer = csv.writer(stream)
     writer.writerow(['时间', '账号', '群聊', '状态', '详情'])
     for row in _history_rows():
-        writer.writerow([("'" + value) if value.startswith(('=', '+', '-', '@')) else value for value in row.values()])
+        writer.writerow([
+            ("'" + value) if (value.lstrip().startswith(('=', '+', '-', '@')) or value.startswith(('\t', '\r'))) else value
+            for value in row.values()
+        ])
     return Response('\ufeff' + stream.getvalue(), mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename=checkin-history.csv'})
 
 
 @app.get('/api/stats')
 def api_stats():
-    days = max(1, min(365, int(request.args.get('days') or 30)))
-    since = f'{local_now(read_cfg()) - timedelta(days=days-1):%Y-%m-%d}'
+    days = _parse_int_arg('days', 30, 1, 365)
+    now_dt = local_now(read_cfg())
+    today_str = f'{now_dt:%Y-%m-%d}'
+    since = f'{now_dt - timedelta(days=days-1):%Y-%m-%d}'
     keys = ('成功', '未确认', '失败')
     total, by_day, by_account = dict.fromkeys(keys, 0), {}, {}
     for row in _history_rows():
-        if not since <= row['time'][:10] <= f'{local_now(read_cfg()):%Y-%m-%d}':
+        if not since <= row['time'][:10] <= today_str:
             continue
         day, account, status = row['time'][:10], row['account'], row['status']
         if status not in keys:
@@ -791,13 +918,36 @@ def _gui_listen():
     return str(os.environ.get('CHECKIN_GUI_HOST') or cfg.get('gui_host') or HOST), int(os.environ.get('CHECKIN_GUI_PORT') or cfg.get('gui_port') or 8577), str(os.environ.get('CHECKIN_GUI_TOKEN') or cfg.get('gui_token') or '').strip()
 
 
+def _current_token():
+    env_token = os.environ.get('CHECKIN_GUI_TOKEN', '').strip()
+    if env_token:
+        return env_token
+    try:
+        cfg_token = str(read_cfg().get('gui_token') or '').strip()
+        if cfg_token:
+            _RUNTIME_LISTEN['token'] = cfg_token
+        return cfg_token
+    except ValueError:
+        return _RUNTIME_LISTEN.get('token', '')
+
+
 @app.before_request
 def _require_token():
     if not request.path.startswith('/api/'):
         return None
-    token = _gui_listen()[2]
+    token = _current_token()
     if token and not secrets.compare_digest(request.headers.get('X-Token', ''), token):
         return jsonify(ok=False, error='需要访问令牌'), 401
+
+
+@app.after_request
+def _security_headers(response):
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'no-referrer')
+    if request.path.startswith('/api/') or request.path == '/':
+        response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 def run():
@@ -807,6 +957,7 @@ def run():
     host, port, token = _gui_listen()
     if host not in ('127.0.0.1', 'localhost', '::1') and not token:
         raise ValueError('监听非本机地址前必须设置 CHECKIN_GUI_TOKEN 或 gui_token')
+    _RUNTIME_LISTEN.update(host=host, token=token)
     BOT['loop'] = asyncio.new_event_loop()
     BOT['stopping'] = False
     SCHEDULER = scheduler.DailyScheduler(read_cfg, _submit_scheduled)
@@ -824,6 +975,18 @@ def run():
     try:
         serve(app, host=host, port=port, threads=8)
     finally:
+        with _lock:
+            proc = BOT.get('login_process')
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                BOT['login_process'] = None
         async def shutdown():
             BOT['stopping'] = True
             if BOT.get('task') and not BOT['task'].done():

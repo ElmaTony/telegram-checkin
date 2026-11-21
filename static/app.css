@@ -321,7 +321,8 @@ dialog>p, dialog form>p { margin-bottom: 20px; }
 .dialog-error { padding: 12px; margin-bottom: 16px; border-radius: 7px; background: var(--bad-fill); color: var(--bad); font-size: 12px; }
 .plan-list { padding: 16px; margin: 17px 0; border: 1px solid var(--line); border-radius: 9px; background: var(--soft); font-size: 12px; }
 .plan-list p+p { margin-top: 8px; }
-.notifications { position: fixed; right: 20px; bottom: 20px; z-index: 200; display: flex; flex-direction: column; gap: 8px; max-width: min(430px,calc(100% - 40px)); pointer-events: none; }
+.notifications { position: fixed; inset: auto 20px 20px auto; margin: 0; padding: 0; border: 0; background: transparent; overflow: visible; z-index: 200; display: flex; flex-direction: column; gap: 8px; max-width: min(430px,calc(100% - 40px)); pointer-events: none; }
+.notifications:popover-open { display: flex; }
 .toast { padding: 13px 17px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: var(--shadow); font-size: 12px; overflow-wrap: anywhere; }
 .toast.error { color: var(--bad); }
 .file-import { display: none; }

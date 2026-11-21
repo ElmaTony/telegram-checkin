@@ -61,7 +61,7 @@ export function statusInfo(row){
  return {code:'pending',label:'待执行',symbol:'○'};
 }
 export const badge = row => {const s=statusInfo(row);return `<span class="status-badge ${s.code}${s.legacy?' legacy':''}"><span aria-hidden="true">${s.symbol}</span>${s.label}</span>`;};
-export function notify(message,error=false){const el=document.createElement('div');el.className='toast'+(error?' error':'');el.textContent=message;const host=document.querySelector('#notifications');while(host.children.length>=2)host.firstElementChild.remove();host.append(el);setTimeout(()=>el.remove(),error?8000:4000);}
+export function notify(message,error=false){const el=document.createElement('div');el.className='toast'+(error?' error':'');el.textContent=message;const host=document.querySelector('#notifications');while(host.children.length>=2)host.firstElementChild.remove();host.append(el);if(typeof host.showPopover==='function'){try{host.hidePopover();host.showPopover();}catch{}}setTimeout(()=>{el.remove();if(!host.children.length&&typeof host.hidePopover==='function'){try{host.hidePopover();}catch{}}},error?8000:4000);}
 export async function api(path,body,options={}){
  const response=await fetch(path,{...options,method:body===undefined?'GET':'POST',headers:{'X-Token':sessionStorage.getItem('gui_token')||localStorage.getItem('gui_token')||'',...(body===undefined?{}:{'Content-Type':'application/json'}),...options.headers},...(body===undefined?{}:{body:JSON.stringify(body)})});
  if(response.status===401){const dialog=document.querySelector('#token-dialog');if(!dialog.open)dialog.showModal();throw new Error('请输入访问令牌');}

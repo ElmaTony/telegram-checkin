@@ -16,6 +16,7 @@ import logging
 import socket
 import sys
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from contextlib import asynccontextmanager
@@ -26,7 +27,7 @@ from core.config import safe_name
 from core.logic import button_message_ref
 from core.locks import FileLock
 from core.storage import atomic_write
-from core.paths import BASE_DIR, configure_browser_path, visible_browser_available
+from core.paths import BASE_DIR, account_lock_path, configure_browser_path, visible_browser_available
 
 log = logging.getLogger("checkin.web")
 
@@ -57,20 +58,41 @@ COMMON_PROXY_PORTS = [
 ]
 
 
+def _build_proxy_dict(raw):
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    if value.startswith("//"):
+        value = "http:" + value
+    if "://" not in value:
+        value = "http://" + value
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.username is not None:
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        netloc = f"{host}:{parsed.port}" if parsed.port else host
+        server = urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ""))
+        result = {"server": server, "username": urllib.parse.unquote(parsed.username)}
+        if parsed.password is not None:
+            result["password"] = urllib.parse.unquote(parsed.password)
+        return result
+    return {"server": value}
+
+
 def resolve_proxy(cfg):
     """网页引擎的代理：配置项 web_proxy 优先，其次系统代理，再探测常见本地端口。"""
     explicit = str(cfg.get("web_proxy") or "").strip()
+    if explicit.lower() in ("direct", "none"):
+        return None
     if explicit:
-        if "//" not in explicit:
-            explicit = "http://" + explicit
-        return {"server": explicit}
-    sys_proxy = urllib.request.getproxies().get("https") or urllib.request.getproxies().get("http")
+        return _build_proxy_dict(explicit)
+    proxies = urllib.request.getproxies()
+    sys_proxy = proxies.get("https") or proxies.get("http") or proxies.get("socks")
     if sys_proxy:
-        if sys_proxy.startswith("//"):
-            sys_proxy = "http:" + sys_proxy
-        if "//" not in sys_proxy:
-            sys_proxy = "http://" + sys_proxy
-        return {"server": sys_proxy}
+        if not proxies.get("https") and not proxies.get("http") and "://" not in sys_proxy:
+            sys_proxy = "socks5://" + sys_proxy
+        return _build_proxy_dict(sys_proxy)
     for scheme, port in COMMON_PROXY_PORTS:
         host = "127.0.0.1"
         if cfg.get("web_proxy_host"):
@@ -128,7 +150,7 @@ class WebEngine:
     # ---------- 基础 ----------
 
     async def launch(self):
-        self._profile_lock = FileLock(PROFILES_DIR.parent / "locks" / (safe_name(self.name) + ".lock"))
+        self._profile_lock = FileLock(account_lock_path(PROFILES_DIR.parent.parent, safe_name(self.name)))
         self._profile_lock.acquire()
         try:
             self.profile.mkdir(parents=True, exist_ok=True)
@@ -139,8 +161,9 @@ class WebEngine:
                     self._topic_ids = cache
             except (OSError, ValueError):
                 pass  # A disposable navigation hint; never an authority for sending.
+            proxy = await asyncio.to_thread(resolve_proxy, self.cfg)
             self.pw = await async_playwright().start()
-            options = {"headless": self.headless, "proxy": resolve_proxy(self.cfg),
+            options = {"headless": self.headless, "proxy": proxy,
                        "viewport": {"width": 1280, "height": 800},
                        "args": ["--disable-blink-features=AutomationControlled"]}
             if self.cfg.get("web_browser_channel"):
@@ -156,22 +179,33 @@ class WebEngine:
             raise
 
     async def close(self):
-        try:
-            if self.browser:
-                try:
-                    await self.browser.close()
-                finally:
-                    self.browser = None
-        finally:
+        async def _teardown():
             try:
-                if self.pw:
-                    await self.pw.stop()
+                if self.browser:
+                    browser, self.browser = self.browser, None
+                    try:
+                        await asyncio.wait_for(browser.close(), timeout=15)
+                    except Exception:
+                        pass
             finally:
-                self.pw = None
-                self.page = None
-                if self._profile_lock:
-                    self._profile_lock.release()
-                    self._profile_lock = None
+                try:
+                    if self.pw:
+                        pw, self.pw = self.pw, None
+                        try:
+                            await asyncio.wait_for(pw.stop(), timeout=10)
+                        except Exception:
+                            pass
+                finally:
+                    self.page = None
+                    if self._profile_lock:
+                        self._profile_lock.release()
+                        self._profile_lock = None
+        task = asyncio.create_task(_teardown())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
 
     def marker(self):
         return self.profile.parent / (self.profile.name + ".loggedin")
@@ -272,7 +306,7 @@ class WebEngine:
 
     _CHAT_VIEW_JS = r"""(options = {}) => {
             options ||= {};
-            const visible = el => el && el.checkVisibility() && !el.closest('.bubbles, .chatlist-container, ul.chatlist');
+            const visible = el => el && el.checkVisibility() && !el.closest('.bubbles, .chatlist-container, ul.chatlist, .sidebar-right, .topics-slider');
             const titles = [...document.querySelectorAll('.chat-info .peer-title, .topbar .peer-title')].filter(visible);
             const title = titles.find(el => el.hasAttribute('data-thread-id')) || titles.find(el => el.getAttribute('data-peer-id')) || titles[0];
             const inputs = [...document.querySelectorAll('[contenteditable="true"][data-peer-id]')].filter(visible);
@@ -281,10 +315,11 @@ class WebEngine:
             const inputPid = composer && composer.getAttribute('data-peer-id');
             const thread = title?.getAttribute('data-thread-id');
             const inputThread = composer?.getAttribute('data-thread-id');
+            const normThread = v => (v && v !== '0') ? v : null;
             const info = !title ? {} : {pid: inputPid && inputPid !== pid ? null : pid,
                 title: title.textContent.trim(), username: title.getAttribute('data-username') || '',
-                composer_peer: inputPid, topic_id: thread && thread!=='0' ? thread : null, composer_topic_id: inputThread || null};
-            if (thread && inputThread && thread !== inputThread) info.pid = null;
+                composer_peer: inputPid, topic_id: normThread(thread), composer_topic_id: normThread(inputThread)};
+            if (normThread(inputThread) && normThread(thread) !== normThread(inputThread)) info.pid = null;
             if (!options.peer) return info;
             const rows = [];
             for (const pane of document.querySelectorAll('.topics-slider .topics-container')) {
@@ -571,32 +606,83 @@ class WebEngine:
             const info = state.info;
             const opened = info.pid===options.peer && info.composer_peer===options.peer && info.title===options.title &&
                 info.topic_id && (!options.id || info.topic_id===options.id);
-            return opened || state.matches.length ? state : false;
+            const pane = [...document.querySelectorAll('.topics-slider .topics-container')].find(p => p.checkVisibility() &&
+                p.querySelector('.sidebar-header__title .peer-title[data-peer-id], .sidebar-header .peer-title[data-peer-id]')?.getAttribute('data-peer-id') === options.peer);
+            return opened || state.matches.length || pane ? {...state, has_pane: !!pane} : false;
         }"""
         opened_js = """options => {
             const info = (""" + self._CHAT_VIEW_JS + """)();
             return info.pid===options.peer && info.composer_peer===options.peer && info.title===options.title &&
                 info.topic_id===options.id ? info : false;
         }"""
+        scroll_topic_js = r"""({peer, title, configured, reset=false}) => {
+            const pane = [...document.querySelectorAll('.topics-slider .topics-container')].find(p => p.checkVisibility() &&
+                p.querySelector('.sidebar-header__title .peer-title[data-peer-id], .sidebar-header .peer-title[data-peer-id]')?.getAttribute('data-peer-id') === peer);
+            if (!pane) return null;
+            const sc = pane.querySelector('.scrollable-y');
+            if (sc && reset) sc.scrollTop = 0;
+            const matches = [];
+            for (const row of pane.querySelectorAll('a[data-peer-id][data-thread-id]')) {
+                if (!row.checkVisibility() || row.getAttribute('data-peer-id') !== peer) continue;
+                const tid = row.getAttribute('data-thread-id');
+                if (!tid || tid === '0') continue;
+                const name = row.querySelector('.row-title .peer-title')?.textContent.trim();
+                if (name === title) matches.push(tid);
+            }
+            let moved = false;
+            if (sc && !(configured && matches.includes(configured))) {
+                const before = sc.scrollTop;
+                sc.scrollTop += Math.max(120, Math.floor(sc.clientHeight * 0.8));
+                moved = sc.scrollTop > before;
+            }
+            return {matches: [...new Set(matches)], moved};
+        }"""
         try:
             handle = await self.page.wait_for_function(state_js, arg=options, timeout=max(1,int(timeout*1000)), polling='raf')
             state = await handle.json_value()
             await handle.dispose()
-            if configured:
-                state['matches'] = [thread for thread in state['matches'] if thread == configured]
-                if not state['matches'] and state['info'].get('topic_id') != configured:
-                    raise TopicSelectionError('所选话题 ID 已不可用或名称已改变，请在规则中重新选择话题；未发送')
-            if len(state['matches']) > 1:
-                raise TopicSelectionError(f'目标群内存在多个同名话题「{topic}」，已停止选择以避免误发')
             info = state['info']
             if (info.get('pid') == peer and info.get('composer_peer') == peer and info.get('title') == topic
                     and info.get('topic_id') and (not cached or info['topic_id'] == cached)):
                 self._remember_topic(peer, topic, info['topic_id'])
                 via = 'already_open'
             else:
-                thread = state['matches'][0]
+                all_matches = list(dict.fromkeys(state.get('matches', [])))
+                if state.get('has_pane') and (not all_matches or (configured and configured not in all_matches)):
+                    steps = 0
+                    while time.monotonic() < deadline and steps < 40:
+                        scan = await self.page.evaluate(scroll_topic_js, {'peer': peer, 'title': topic, 'configured': configured, 'reset': steps == 0})
+                        if not scan:
+                            break
+                        for tid in scan['matches']:
+                            if tid not in all_matches:
+                                all_matches.append(tid)
+                        if configured and configured in all_matches:
+                            break
+                        if not scan['moved']:
+                            break
+                        steps += 1
+                        await asyncio.sleep(0.08)
+                if configured:
+                    all_matches = [thread for thread in all_matches if thread == configured]
+                    if not all_matches and info.get('topic_id') != configured:
+                        raise TopicSelectionError('所选话题 ID 已不可用或名称已改变，请在规则中重新选择话题；未发送')
+                if len(all_matches) > 1:
+                    raise TopicSelectionError(f'目标群内存在多个同名话题「{topic}」，已停止选择以避免误发')
+                if not all_matches:
+                    return False
+                thread = all_matches[0]
                 # Re-resolve the same identity if Telegram re-renders its virtual list.
                 row = self.page.locator(f'.topics-slider .topics-container a[data-peer-id="{peer}"][data-thread-id="{thread}"]:visible').first
+                if not await row.count():
+                    await self.page.evaluate(scroll_topic_js, {'peer': peer, 'title': topic, 'configured': thread, 'reset': True})
+                    steps = 0
+                    while time.monotonic() < deadline and steps < 40 and not await row.count():
+                        scan = await self.page.evaluate(scroll_topic_js, {'peer': peer, 'title': topic, 'configured': thread, 'reset': False})
+                        if not scan or not scan['moved']:
+                            break
+                        steps += 1
+                        await asyncio.sleep(0.08)
                 await row.click(timeout=max(1,int((deadline-time.monotonic())*1000)))
                 remaining = max(1,int((deadline-time.monotonic())*1000))
                 handle = await self.page.wait_for_function(opened_js, arg={**options,'id':thread}, timeout=remaining, polling='raf')
@@ -633,7 +719,7 @@ class WebEngine:
         finally:
             await handle.dispose()
 
-    async def open_chat(self, chat_ref, title=None, topic=None, folder=None, topic_id=None):
+    async def open_chat(self, chat_ref, title=None, topic=None, folder=None, topic_id=None, require_composer=True):
         await self._assert_media_clear()
         ref = str(chat_ref).strip().lstrip("#")
         self._mids_chat = ref
@@ -644,12 +730,12 @@ class WebEngine:
         self._expected_topic_id = None
         self._configured_topic_id = str(topic_id) if topic_id else None
         try:
-            await asyncio.wait_for(self._navigate(ref, title, topic, folder), timeout=45)
+            await asyncio.wait_for(self._navigate(ref, title, topic, folder, require_composer=require_composer), timeout=45)
             await self.assert_destination()
         except asyncio.TimeoutError as error:
             raise RuntimeError(f"打开 {title or ref} 超过 45 秒；未发送，请检查会话是否仍可访问") from error
 
-    async def _navigate(self, ref, title, topic, folder):
+    async def _navigate(self, ref, title, topic, folder, require_composer=True):
         async def ready(timeout=3):
             if topic:
                 if not await self._enter_topic(str(topic), timeout=timeout):
@@ -657,7 +743,8 @@ class WebEngine:
             elif not await self._wait_opened(ref, timeout=timeout):
                 return False
             try:
-                await self._first(SEL_COMPOSER, timeout=1500)
+                if require_composer:
+                    await self._first(SEL_COMPOSER, timeout=1500)
                 await self.assert_destination()
                 return True
             except RuntimeError:
@@ -665,6 +752,7 @@ class WebEngine:
 
         if ref.startswith("@") and not self._expected_peer:
             # Resolve a username from an actual matching search result, never its hash.
+            await self._close_topic_panel()
             box = await self._first(SEL_SEARCH, timeout=1500)
             await box.fill("")
             await box.type(ref, delay=30)
@@ -685,6 +773,7 @@ class WebEngine:
                         if await ready():
                             return
             raise RuntimeError("无法可靠解析 @用户名，请从会话列表选用数字 ID；未发送")
+        target_ref = str(self._expected_peer or ref)
         if topic:
             info = await self.opened_chat_info()
             if info.get('pid') == self._expected_peer and info.get('title') == str(topic).strip() and info.get('topic_id'):
@@ -699,15 +788,15 @@ class WebEngine:
         await self._close_topic_panel()
         if not topic and await self._open_visible_chat(self._expected_peer) and await ready(2):
             return
-        if topic and folder and await self._open_via_folder(ref, folder, topic):
+        if topic and folder and await self._open_via_folder(target_ref, folder, topic):
             await self.assert_destination()
             return
-        await self.page.evaluate("h => { location.hash = h; }", ref)
+        await self.page.evaluate("h => { location.hash = h; }", target_ref)
         if await ready(2):
             return
-        if folder and not topic and await self._open_via_folder(ref, folder, topic) and await ready(2):
+        if folder and not topic and await self._open_via_folder(target_ref, folder, topic) and await ready(2):
             return
-        item = await self._scroll_find(ref, time.monotonic() + 5)
+        item = await self._scroll_find(target_ref, time.monotonic() + 5)
         if item is not None:
             try:
                 await self._close_topic_panel()
@@ -716,12 +805,12 @@ class WebEngine:
                     return
             except Exception as error:
                 log.debug('列表定位失败，改用搜索：%s', error)
-        if title and await self._open_by_search(str(title), int(self._expected_peer)) and await ready(3):
+        if title and self._expected_peer and await self._open_by_search(str(title), int(self._expected_peer)) and await ready(3):
             return
         await self.page.reload(wait_until="domcontentloaded", timeout=12000)
         if await ready(5):
             return
-        if title and await self._open_by_search(str(title), int(self._expected_peer)) and await ready(3):
+        if title and self._expected_peer and await self._open_by_search(str(title), int(self._expected_peer)) and await ready(3):
             return
         # A route can finish rendering just after a fallback exhausts its budget.
         # Recheck both the composer and destination before reporting a failure.
@@ -738,14 +827,15 @@ class WebEngine:
         result = {"chat": str(chat_ref), "name": title or str(chat_ref), "ok": False,
                   "via": "verified", "composer": False, "send_btn": False, "error": None}
         try:
-            await self.open_chat(chat_ref, title, topic, folder, topic_id)
+            require_composer = method != "button_only"
+            await self.open_chat(chat_ref, title, topic, folder, topic_id, require_composer=require_composer)
             result["composer"] = await self._visible(SEL_COMPOSER)
             result["send_btn"] = await self._visible(SEL_SEND)
             if method in ("image_text", "image_only"):
                 result["attachment"] = await self._visible(['attach-menu-button', '.attach-file', "[aria-label='Chat.Input.Attach']"])
                 if not result["attachment"]:
                     raise RuntimeError("目标已核对，但附件入口不可用")
-            result["ok"] = result["composer"]
+            result["ok"] = True if method == "button_only" else result["composer"]
         except Exception as error:
             result["error"] = str(error)
         result["elapsed"] = round(time.monotonic() - started, 2)
@@ -775,14 +865,15 @@ class WebEngine:
             yield
             return
         record = {'peer':str(self._expected_peer),'topic':self._expected_topic,
-                  'topic_id':self._expected_topic_id,'text':text,'html':html,'created':time.time()}
+                  'topic_id':self._expected_topic_id,'text':text,'html':html,'has_atoms':bool(has_atoms),'created':time.time()}
         backup = self.profile / 'checkin-drafts' / (uuid.uuid4().hex + '.json')
         atomic_write(backup, json.dumps(record, ensure_ascii=False, indent=2))
         try:
             await composer.click()
             await composer.press('ControlOrMeta+A')
             await composer.press('Backspace')
-            if (await composer.inner_text()).strip():
+            remain_atoms = await composer.locator('img,custom-emoji-element,[data-type="mention"]').count()
+            if (await composer.inner_text()).strip() or remain_atoms:
                 raise RuntimeError('未能暂存输入框草稿，已停止发送')
             yield
         finally:
@@ -800,11 +891,15 @@ class WebEngine:
                 raise RuntimeError('当前会话或话题已改变')
             composer=await self._first(SEL_COMPOSER,timeout=2000)
             current=await composer.inner_text()
-            if current.strip():
+            current_atoms = await composer.locator('img,custom-emoji-element,[data-type="mention"]').count()
+            if current.strip() or current_atoms:
                 if await composer.inner_html()==record['html']:
                     backup.unlink(missing_ok=True)
                     return
-                if current.strip()!=str(self._automation_text or '').strip():
+                auto = str(self._automation_text or '').strip()
+                cur = current.strip()
+                is_auto_residue = bool(auto and cur and not current_atoms and (cur == auto or auto.startswith(cur)))
+                if not is_auto_residue:
                     raise RuntimeError('输入框出现了新的草稿，已保留现有内容')
                 await composer.click();await composer.press('ControlOrMeta+A');await composer.press('Backspace')
             await composer.click()
@@ -818,8 +913,12 @@ class WebEngine:
             if not (await composer.inner_text()).strip() and record['text'].strip():
                 await self.page.keyboard.insert_text(record['text'])
                 fallback=True
-            if (await composer.inner_text()).strip()!=record['text'].strip():
+            restored_text = (await composer.inner_text()).strip()
+            restored_atoms = await composer.locator('img,custom-emoji-element,[data-type="mention"]').count()
+            if restored_text != record['text'].strip():
                 raise RuntimeError('编辑器恢复后的内容与原草稿不一致')
+            if record.get('has_atoms') and not restored_atoms:
+                raise RuntimeError('原草稿包含表情或富文本元素，未能确认完整恢复')
             if fallback and any(tag in record['html'].lower() for tag in ('<strong','<em>','<a ','<code','custom-emoji','data-type="mention"')):
                 raise RuntimeError('草稿文字已恢复，富文本格式需要核对')
             await asyncio.sleep(.25)  # Editor input events allow Telegram to sync its draft.
@@ -828,20 +927,6 @@ class WebEngine:
         except Exception as error:
             self.last_draft_warning=f'原草稿恢复需核对：{error}；备份保留于 {backup}'
             log.error('[%s] %s',self.name,self.last_draft_warning)
-
-    async def _send_completed(self):
-        """K 发送成功的标志：输入框已清空 且 发送按钮回到待机（record）态。
-
-        注意不能用"气泡数增加"判断——K 发送后会重载消息区 DOM，气泡数反而变少。
-        """
-        try:
-            if await self._composer_text():
-                return False
-            return await self.page.evaluate(
-                """() => { const el = document.querySelector('.btn-send');
-                   return el ? el.classList.contains('record') : true; }""")
-        except Exception:
-            return False
 
     async def _last_out_mid(self):
         """当前会话里我最后一条发出消息的 data-mid（没有则为 None）。"""
@@ -874,7 +959,7 @@ class WebEngine:
                 candidates = [record for record in observed.get('items', [])
                               if record.get('out') and record['mid'] not in boundary.get('seen', set())
                               and record['mid'] not in existing
-                              and record.get('ts', 0) >= int(boundary.get('cutoff', time.time()))]
+                              and record.get('ts', 0) >= int(boundary.get('cutoff', time.time())) - 5]
                 if candidates:
                     observed_ids.update(str(record['mid']) for record in candidates)
                     self.last_sent_mids.update(observed_ids)
@@ -933,7 +1018,7 @@ class WebEngine:
                 await self._track_sent_mid(pre_mid)
                 return
         error = RuntimeError("发送状态不明，输入框尚未清空；请先核对消息，勿直接重复发送")
-        error.sent = True
+        error.sent = error.uncertain = True
         raise error
 
     MEDIA_PREVIEW_SELECTOR = '.popup.popup-new-media:visible, .popup.popup-send-photo:visible'
@@ -946,15 +1031,22 @@ class WebEngine:
         deadline = time.monotonic() + timeout / 1000
         while time.monotonic() < deadline:
             for selector in selectors:
-                for control in await preview.query_selector_all(selector):
-                    if await control.is_visible() and await control.is_enabled():
-                        return control
+                controls = await preview.query_selector_all(selector)
+                found = None
+                for control in controls:
+                    if found is None and await control.is_visible() and await control.is_enabled():
+                        found = control
+                    else:
+                        await control.dispose()
+                if found is not None:
+                    return found
             await asyncio.sleep(min(.1, max(0, deadline - time.monotonic())))
         raise RuntimeError(f'图片预览的{label}不可用，未执行发送')
 
     async def _dismiss_media_preview(self):
         """Dismiss only the preview opened by this image attempt, before draft restore."""
         preview = self._media_preview
+        close = None
         try:
             if preview is None and self._media_upload_started:
                 popup = self.page.locator(self.MEDIA_PREVIEW_SELECTOR)
@@ -971,6 +1063,17 @@ class WebEngine:
             warning = '本轮图片预览未能关闭，请在 Telegram 核对；已停止后续会话切换'
             self.last_draft_warning = '；'.join(filter(None,(self.last_draft_warning,warning)))
         finally:
+            if close is not None:
+                try:
+                    await close.dispose()
+                except Exception:
+                    pass
+            if preview is not None:
+                try:
+                    await preview.dispose()
+                except Exception:
+                    pass
+            self._media_preview = None
             self._media_upload_started = False
 
     async def _open_attach(self):
@@ -1021,7 +1124,12 @@ class WebEngine:
             async with self.page.expect_file_chooser(timeout=10000) as fc_info:
                 if not await self._open_attach():
                     raise RuntimeError("找不到附件按钮")
-                menu = await self._first([".btn-menu-item:has-text('图片或视频')",".btn-menu-item:has-text('Photo or Video')"],timeout=2500)
+                menu = await self._first([
+                    ".btn-menu-item:has-text('图片或视频')",
+                    ".btn-menu-item:has-text('相片或影片')",
+                    ".btn-menu-item:has-text('圖片或影片')",
+                    ".btn-menu-item:has-text('Photo or Video')",
+                ], timeout=2500)
                 await menu.click(timeout=1500)
             chooser = await fc_info.value
             self._media_upload_started = True
@@ -1038,17 +1146,26 @@ class WebEngine:
         # 3) 说明文字填到预览层的输入框里（主输入框此时不是发送目标）
         if caption:
             el = await self._media_control(preview,['[contenteditable="true"]','textarea','input[placeholder]'],'说明输入框')
-            await el.click(timeout=1500)
-            await el.type(caption,delay=random_delay(30,80),timeout=30000)
+            try:
+                await el.click(timeout=1500)
+                for index, line in enumerate(str(caption).split("\n")):
+                    if index:
+                        await self.page.keyboard.press("Shift+Enter")
+                    await self.page.keyboard.type(line, delay=random_delay(30, 80))
+            finally:
+                await el.dispose()
 
         await self.assert_destination()
         # 4) 点预览层的发送按钮（Enter 在预览层不保证触发）
         btn = await self._media_control(preview,['.simple-message-input-confirm','.btn-send'],'发送按钮')
-        if self.before_send:
-            await self.before_send()
-        capture_since = time.time()
-        self._media_dispatch_attempted = True
-        await btn.click(timeout=2000)
+        try:
+            if self.before_send:
+                await self.before_send()
+            capture_since = time.time()
+            self._media_dispatch_attempted = True
+            await btn.click(timeout=2000)
+        finally:
+            await btn.dispose()
         self._start_send_clock(capture_since)
 
         # 5) 验证预览层消失 = 已发出
@@ -1058,11 +1175,38 @@ class WebEngine:
             raise RuntimeError('图片发送结果待核对，请先核对消息，不要直接重发') from error
         await self._track_sent_mid(pre_mid)
 
+    _CLICK_BUTTON_JS = r"""({allowed, privateChat, cutoff, seen, textPart, selectors}) => {
+        const normalize = v => String(v || '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F]/g, '').replace(/\s+/g, ' ').trim();
+        const needle = normalize(textPart);
+        const allowedSet = new Set(allowed.map(String));
+        const seenSet = new Set(seen.map(String));
+        const bubbles = [...document.querySelectorAll('.bubbles .bubble.is-in')];
+        for (let i = bubbles.length - 1; i >= 0; i--) {
+            const b = bubbles[i];
+            const mid = b.getAttribute('data-mid');
+            const stamp = Number(b.getAttribute('data-timestamp') || 0);
+            const replyTo = b.getAttribute('data-reply-to-mid');
+            const related = (replyTo && allowedSet.has(String(replyTo))) || (privateChat && stamp >= Math.floor(cutoff) - 5);
+            if (!related || (mid && seenSet.has(String(mid)))) continue;
+            const btns = [...b.querySelectorAll(selectors)].filter(el => el.checkVisibility() && !el.parentElement?.closest(selectors));
+            for (const btn of btns) {
+                const clone = (btn.querySelector('.reply-markup-button-text') || btn).cloneNode(true);
+                clone.querySelectorAll('img[alt]').forEach(img => img.replaceWith(img.alt));
+                if (normalize(clone.textContent).includes(needle)) {
+                    const isLink = !!btn.getAttribute('href') || !!btn.querySelector('a[href], [href]');
+                    return {el: btn, mid: mid ? String(mid) : null, isLink};
+                }
+            }
+        }
+        return null;
+    }"""
+
     async def click_button(self, text_part, timeout=25):
         await self.assert_destination()
         boundary = self._capture_by_chat.get(self._mids_chat, {})
         cutoff = boundary.get("cutoff", time.time())
         deadline = time.monotonic() + timeout
+        selectors = ", ".join(SEL_BTN_ROW)
         while time.monotonic() < deadline:
             await self.assert_destination()
             observed = await self.page.evaluate(self._IN_COLLECT_JS, {"peer": str(self._expected_peer), "reset": False})
@@ -1071,55 +1215,69 @@ class WebEngine:
                     self.last_sent_mids.add(str(new))
                 if self._active_mids is not None and str(old) in self._active_mids:
                     self._active_mids.add(str(new))
-            bubbles = self.page.locator('.bubbles .bubble.is-in')
-            for index in range(await bubbles.count() - 1, -1, -1):
-                bubble = bubbles.nth(index)
-                mid = await bubble.get_attribute('data-mid')
-                stamp = float(await bubble.get_attribute('data-timestamp') or 0)
-                reply_to = await bubble.get_attribute('data-reply-to-mid')
-                private = bool(self._expected_peer and str(self._expected_peer).isdigit())
-                allowed = self._active_mids if self._active_mids is not None else self.last_sent_mids
-                related = str(reply_to) in allowed or (private and stamp >= int(cutoff))
-                if not related or mid in boundary.get("seen", set()):
-                    continue
-                for selector in SEL_BTN_ROW:
-                    buttons = bubble.locator(selector)
-                    for button_index in range(await buttons.count()):
-                        button = buttons.nth(button_index)
-                        if await button.is_visible() and text_part in await button.inner_text():
-                            if await button.get_attribute('href'):
-                                raise RuntimeError("匹配到网址按钮，已停止自动点击")
+            private = bool(self._expected_peer and str(self._expected_peer).isdigit())
+            allowed = self._active_mids if self._active_mids is not None else self.last_sent_mids
+            handle = await self.page.evaluate_handle(self._CLICK_BUTTON_JS, {
+                "allowed": sorted(str(x) for x in allowed),
+                "privateChat": private,
+                "cutoff": cutoff,
+                "seen": sorted(str(x) for x in boundary.get("seen", ())),
+                "textPart": text_part,
+                "selectors": selectors,
+            })
+            try:
+                is_null = await handle.evaluate("v => !v")
+                if not is_null:
+                    meta = await handle.evaluate("v => ({mid: v.mid, isLink: v.isLink})")
+                    if meta.get("isLink"):
+                        raise RuntimeError("匹配到网址按钮，已停止自动点击")
+                    el_handle = await handle.get_property("el")
+                    try:
+                        button = el_handle.as_element()
+                        if button:
                             await self.assert_destination()
                             await button.click(timeout=max(100, int((deadline - time.monotonic()) * 1000)))
+                            if meta.get("mid") and self._active_mids is not None:
+                                self._active_mids.add(meta["mid"])
                             return True
+                    finally:
+                        await el_handle.dispose()
+            finally:
+                await handle.dispose()
             await asyncio.sleep(min(.25, max(0, deadline - time.monotonic())))
         return False
 
     _EXISTING_BUTTON_JS = r"""({peer, mid, label, earliest, selectors}) => {
-        const normalize = value => value.replace(/[\uFE0E\uFE0F]/g,'').replace(/\s+/g,' ').trim();
+        const normalize = value => String(value || '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F]/g,'').replace(/\s+/g,' ').trim();
+        const isSafeButton = el => el.matches('button:not([href], [disabled], [aria-disabled="true"], .is-disabled)') &&
+            !el.querySelector('.reply-markup-button-icon, a, [href]');
         const matches = rows => rows.filter(b => b.dataset.peerId === peer && b.checkVisibility() &&
-            (mid ? b.dataset.mid === mid : Number(b.dataset.timestamp) >= earliest))
+            (mid ? b.dataset.mid === mid : Number(b.dataset.timestamp) >= earliest - 5))
             .flatMap(b => [...b.querySelectorAll(selectors)].filter(el => {
+                if (!el.checkVisibility() || el.parentElement?.closest(selectors) || !isSafeButton(el)) return false;
                 const text = (el.querySelector('.reply-markup-button-text') || el).cloneNode(true);
                 text.querySelectorAll('img[alt]').forEach(img => img.replaceWith(img.alt));
-                return normalize(text.textContent) === normalize(label) && el.checkVisibility();
+                return normalize(text.textContent) === normalize(label);
             }).map(el => ({el, mid:Number(b.dataset.mid), ts:Number(b.dataset.timestamp || 0)})));
         const rows = [...document.querySelectorAll('.bubbles .bubble.is-in[data-mid]')];
         const found = matches(rows).sort((a,b) => b.ts - a.ts || b.mid - a.mid);
         if (!found.length || found[1]?.mid === found[0].mid) return null;
-        const {el} = found[0];
-        return el.matches('button:not([href], [disabled], [aria-disabled="true"], .is-disabled)') &&
-            !el.querySelector('.reply-markup-button-icon, a, [href]') ? el : null;
+        return found[0].el;
     }"""
 
     async def click_existing_button(self, label, reference, earliest):
         """Click one incoming message's inline button within the verified conversation."""
         await self.assert_destination()
+        self._last_button_initial_text = None
         peer, mid = str(self._expected_peer), None
         if reference:
             mid, linked_peer, linked_topic = button_message_ref(reference)
-            if linked_peer and linked_peer not in (peer, str(self._mids_chat).lower()):
-                raise ValueError("按钮消息链接与已核对的会话不符，请使用当前会话内的链接或数字消息 ID")
+            if linked_peer:
+                info = await self.opened_chat_info()
+                opened_user = ('@' + info.get('username', '').lstrip('@').lower()) if info.get('username') else ''
+                resolved_match = self._resolved_peers.get(linked_peer) == peer
+                if linked_peer not in (peer, str(self._mids_chat).lower(), opened_user) and not resolved_match:
+                    raise ValueError("按钮消息链接与已核对的会话不符，请使用当前会话内的链接或数字消息 ID")
             if linked_topic and linked_topic != self._expected_topic_id:
                 raise ValueError("按钮消息链接与所选话题不符")
             route = f'{peer}?message={mid}'
@@ -1138,7 +1296,18 @@ class WebEngine:
             await self.assert_destination()
             if await self.page.locator('.popup-confirmation:visible').count():
                 raise RuntimeError("当前已有 Telegram 弹窗，请先处理后再运行签到")
-            origin = await button.evaluate("el => el.closest('.bubble').dataset.mid")
+            meta = await button.evaluate(r"""el => {
+                const b = el.closest('.bubble');
+                const message = b?.querySelector('.message');
+                const body = (message?.querySelector('[data-message-text-source]') || message)?.cloneNode(true);
+                if (body) {
+                    body.querySelectorAll('img[alt]').forEach(img => img.replaceWith(img.alt));
+                    body.querySelectorAll('.time, .reactions, .reply-markup').forEach(n => n.remove());
+                }
+                return {mid: b?.dataset.mid || null, text: (body ? body.textContent : '').trim()};
+            }""")
+            origin = meta['mid']
+            self._last_button_initial_text = meta['text']
             if self.before_send:
                 await self.before_send()
             capture_since = time.time()
@@ -1153,35 +1322,57 @@ class WebEngine:
         finally:
             await handle.dispose()
 
-    async def read_button_popup(self, seconds):
-        """Read the new Telegram callback alert before dismissing its sole OK button."""
-        remaining = self.send_started_monotonic + seconds - time.monotonic()
+    async def read_button_popup(self, seconds, *, poll_timeout=None):
+        """Read the new Telegram callback alert or toast before dismissing its sole OK button."""
+        base_remaining = (self.send_started_monotonic + seconds - time.monotonic()) if self.send_started_monotonic is not None else seconds
+        remaining = min(base_remaining, poll_timeout) if poll_timeout is not None else base_remaining
         if remaining <= 0:
             return ''
         try:
             handle = await self.page.wait_for_function(r"""() => {
                 const visible = el => el.checkVisibility() && el.getBoundingClientRect().height > 0;
                 const dialogs = [...document.querySelectorAll('.popup-confirmation')].filter(visible);
-                if (dialogs.length !== 1) return null;
-                const popup = dialogs[0];
-                const buttons = [...popup.querySelectorAll('.popup-buttons button, .popup-footer button')].filter(visible);
-                if (buttons.length !== 1 || !/^(确定|確認|确认|確定|好|OK|Okay)$/i.test(buttons[0].textContent.trim()) ||
-                    popup.querySelector('input, textarea, select, a[href]')) return null;
-                return popup.querySelector('.popup-description')?.textContent.trim() ? popup : null;
+                if (dialogs.length === 1) {
+                    const popup = dialogs[0];
+                    const buttons = [...popup.querySelectorAll('.popup-buttons button, .popup-footer button')].filter(visible);
+                    const okBtn = buttons.length === 1 && !popup.querySelector('input, textarea, select, a[href]');
+                    const desc = popup.querySelector('.popup-description')?.textContent.trim();
+                    if (okBtn && desc) return {kind: 'popup', el: popup, text: desc};
+                }
+                const toasts = [...document.querySelectorAll('.toast')].filter(visible);
+                if (toasts.length === 1) {
+                    const text = toasts[0].innerText.trim();
+                    if (text) return {kind: 'toast', el: toasts[0], text};
+                }
+                return null;
             }""", timeout=max(1, int(remaining*1000)))
         except PlaywrightTimeoutError:
             return ''
         try:
-            popup = handle.as_element()
-            await self.assert_destination()
-            text = await popup.eval_on_selector('.popup-description', 'el => el.innerText.trim()')
-            button = await popup.query_selector('.popup-buttons button:visible, .popup-footer button:visible')
+            info = await handle.evaluate("v => ({kind: v.kind, text: v.text})")
+            if info['kind'] == 'toast':
+                await self.assert_destination()
+                return info['text']
+            el_handle = await handle.get_property('el')
             try:
-                if button:
-                    await button.click(timeout=1500)
-            except PlaywrightTimeoutError:
-                log.warning('已读到机器人弹窗，关闭按钮未就绪')
-            return text
+                popup = el_handle.as_element()
+                await self.assert_destination()
+                text = await popup.eval_on_selector('.popup-description', 'el => el.innerText.trim()')
+                button = await popup.query_selector('.popup-buttons button:visible, .popup-footer button:visible')
+                try:
+                    if button:
+                        await button.click(timeout=1500)
+                except Exception:
+                    log.warning('已读到机器人弹窗，关闭按钮未就绪')
+                finally:
+                    if button:
+                        try:
+                            await button.dispose()
+                        except Exception:
+                            pass
+                return text
+            finally:
+                await el_handle.dispose()
         finally:
             await handle.dispose()
 
@@ -1251,16 +1442,32 @@ class WebEngine:
         let capture = window.__checkinCapture;
         if (!capture || capture.peer !== options.peer || options.reset) {
             if (capture) capture.observer.disconnect();
-            capture = {peer:options.peer, records:new Map(), ids:new WeakMap(), aliases:[], observer:null};
+            capture = {peer:options.peer, records:new Map(), ids:new WeakMap(), aliases:[], aliasKeys:new Set(), observer:null};
             capture.read = b => {
                     if (!b?.matches?.('.bubble[data-mid]') || b.getAttribute('data-peer-id') !== options.peer) return;
                     const mid=b.getAttribute('data-mid'), previous=capture.ids.get(b);
-                    if(previous && previous!==mid) capture.aliases.push([previous,mid]);
+                    if(previous && previous!==mid){
+                        const k = previous + '->' + mid;
+                        if(!capture.aliasKeys.has(k)){
+                            capture.aliasKeys.add(k);
+                            capture.aliases.push([previous,mid]);
+                            if(capture.aliases.length > 200) capture.aliases.shift();
+                        }
+                    }
                     capture.ids.set(b,mid);
                     const message=b.querySelector('.message');
-                    const body=message?.querySelector('[data-message-text-source]')||message;
-                    const t=(body?body.textContent:b.textContent||'').trim().replace(/(\s*\d{1,2}:\d{2}){1,2}\s*$/, '');
-                    const mentions=[...new Set([...body?.querySelectorAll('[data-follow]')||[]].map(e=>e.getAttribute('data-follow')).filter(id=>/^\d+$/.test(id)))];
+                    const rawBody=message?.querySelector('[data-message-text-source]')||message;
+                    let text='';
+                    if(rawBody){
+                        const clone=rawBody.cloneNode(true);
+                        clone.querySelectorAll('img[alt]').forEach(img=>img.replaceWith(img.alt));
+                        clone.querySelectorAll('.time, .reactions, .reply-markup').forEach(n=>n.remove());
+                        text=clone.textContent||'';
+                    }else{
+                        text=b.textContent||'';
+                    }
+                    const t=text.trim().replace(/(?:\s*(?:edited|已编辑))?(?:\s*\d{1,2}:\d{2}(?:\s*[AP]M)?){1,2}\s*$/i, '').trim();
+                    const mentions=[...new Set([...rawBody?.querySelectorAll('[data-follow]')||[]].map(e=>e.getAttribute('data-follow')).filter(id=>/^\d+$/.test(id)))];
                     const record={mid,t,rm:b.getAttribute('data-reply-to-mid'),ts:Number(b.getAttribute('data-timestamp')||0),
                                   peer:options.peer,mentions,out:b.classList.contains('is-out'),pending:b.classList.contains('is-sending')||mid.includes('.')};
                     capture.records.set(mid,record);
@@ -1273,24 +1480,24 @@ class WebEngine:
                     for (const node of [...mutation.addedNodes,...mutation.removedNodes]) {
                         if (node.nodeType !== 1) continue;
                         capture.read(node);
-                        node.querySelectorAll('.bubble[data-mid]').forEach(capture.read);
+                        if (node.querySelectorAll) node.querySelectorAll('.bubble[data-mid]').forEach(capture.read);
                     }
+                    const target = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
+                    if (target) capture.read(target.closest('.bubble[data-mid]'));
                 }
-                for(const mutation of mutations)if(mutation.target.nodeType===1)capture.read(mutation.target.closest('.bubble[data-mid]'));
-                capture.scan();
             });
             capture.observer.observe(document.body,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['data-mid','data-reply-to-mid','data-peer-id','data-timestamp','class']});
             window.__checkinCapture=capture;
         }
         capture.scan();
-        return {items:[...capture.records.values()],aliases:capture.aliases.splice(0)};
+        return {items:[...capture.records.values()],aliases:[...capture.aliases]};
     }"""
 
     async def current_user_peer(self):
         """Read the active account's ID from its account-menu avatar, never storage."""
         if self._self_peer:
             return self._self_peer
-        toggle = self.page.locator('.sidebar-tools-button')
+        toggle = self.page.locator('.sidebar-tools-button:visible').first
         if not await toggle.count():
             return None
         opened = False
@@ -1307,7 +1514,11 @@ class WebEngine:
             return None
         finally:
             if opened:
-                await self.page.keyboard.press('Escape')
+                try:
+                    if await self.page.locator('[role="menu"]:visible').count():
+                        await self.page.keyboard.press('Escape')
+                except Exception:
+                    pass
         return self._self_peer
 
     async def collect_feedback_history(self, known, seconds=8):
@@ -1348,7 +1559,7 @@ class WebEngine:
         data = await self.page.evaluate(self._IN_COLLECT_JS, {'peer':known['peer'], 'reset':False})
         seen = {str(mid) for mid in known.get('seen', [])}
         window = [r for r in data['items'] if not r.get('pending') and (str(r['mid']) not in seen or str(r['mid']) in known.get('versions', {}))
-                  and int(known['cutoff']) <= r.get('ts',0) <= known['cutoff'] + 30]
+                  and int(known['cutoff']) - 5 <= r.get('ts',0) <= known['cutoff'] + 30]
         outgoing = [r for r in window if r.get('out') and sent_text is not None and r['t'] == str(sent_text).strip()]
         if len(outgoing) == 1:
             return {'sent_mids':[str(outgoing[0]['mid'])], 'evidence':outgoing, 'source':'own_outgoing_history'}
@@ -1378,7 +1589,7 @@ class WebEngine:
         self._capture_by_chat[self._mids_chat] = baseline
         return baseline
 
-    async def watch_new_incoming(self, known, seconds, mode="after", idle_after=2.0, sent_mids=None, started_at=None, is_complete=None):
+    async def watch_new_incoming(self, known, seconds, mode="after", idle_after=2.0, sent_mids=None, started_at=None, is_complete=None, *, watch_button_mid=None, button_initial_text=None, check_popup=False):
         if not isinstance(known, dict) or not known.get("peer"):
             raise ValueError("缺少本轮消息 ID/时间边界，不能安全补查旧记录")
         seen = set(known.get("seen", []))
@@ -1391,8 +1602,17 @@ class WebEngine:
         allowed = set(sent_mids) if sent_mids is not None else self.last_sent_mids
         last_related = None
         first_read = True
+        button_mid_str = str(watch_button_mid) if watch_button_mid else None
         while first_read or time.monotonic() < deadline:
             first_read = False
+            if check_popup:
+                popup_text = await self.read_button_popup(seconds, poll_timeout=0.05)
+                if popup_text:
+                    rec = {'source': 'button_popup', 't': popup_text, 'mid': button_mid_str, 'ts': time.time()}
+                    found.append(popup_text)
+                    replied.append(popup_text)
+                    evidence.append(rec)
+                    break
             remaining = deadline - time.monotonic()
             remaining = remaining if remaining > 0 else .1
             try:
@@ -1412,23 +1632,27 @@ class WebEngine:
                 mid = str(record["mid"])
                 if record.get("out") or not record.get("t"):
                     continue
-                if record.get("ts", 0) < int(known["cutoff"]):
-                    continue
                 exact = str(record.get("rm")) in allowed
-                private = str(known["peer"]).isdigit()
-                relation = 'reply:' + str(record.get('rm')) if exact else 'private' if private else 'unrelated'
-                if mid in seen and (mid not in known['versions'] or known['versions'][mid] == record['t'] and relations.get(mid, 'unrelated') == relation):
+                edited_button = bool(button_mid_str and mid == button_mid_str and button_initial_text is not None and record['t'] != button_initial_text)
+                if not exact and not edited_button and record.get("ts", 0) < int(known["cutoff"]) - 5:
                     continue
-                if not exact and not private and mode == "reply_only":
+                private = str(known["peer"]).isdigit()
+                relation = 'button_edit' if edited_button else ('reply:' + str(record.get('rm')) if exact else 'private' if private else 'unrelated')
+                if not edited_button and mid in seen and (mid not in known['versions'] or known['versions'][mid] == record['t'] and relations.get(mid, 'unrelated') == relation):
+                    continue
+                if edited_button and known['versions'].get(mid) == record['t'] and relations.get(mid) == 'button_edit':
+                    continue
+                if not exact and not private and not edited_button and mode == "reply_only":
                     continue
                 seen.add(mid)
                 known["seen"] = sorted(seen)
                 known["versions"][mid] = record["t"]
                 relations[mid] = relation
                 found.append(record["t"])
-                record = {**record, "source": "reply_to_sent" if exact else "private_chat" if private else "unrelated"}
+                source = "button_popup" if edited_button else ("reply_to_sent" if exact else "private_chat" if private else "unrelated")
+                record = {**record, "source": source}
                 evidence.append(record)
-                if exact or private:
+                if exact or private or edited_button:
                     replied.append(record["t"])
                     last_related = time.monotonic()
             if last_related is not None and time.monotonic() - last_related >= idle_after and (is_complete is None or is_complete(replied)):
@@ -1554,12 +1778,13 @@ class WebEngine:
         const list = populated || lists[0];
         if (!list) return {items: [], next: position, empty, atEnd: false};
         const scroller = list.closest('.scrollable-y');
-        const bottom = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight) : 0;
-        const current = Math.min(position, bottom);
-        if (scroller && Math.abs(scroller.scrollTop - current) > 1) {
+        const bottom = scroller ? Math.max(0, Math.floor(scroller.scrollHeight - scroller.clientHeight)) : 0;
+        const current = Math.min(Math.floor(position), bottom);
+        if (scroller && Math.abs(scroller.scrollTop - current) > 3) {
             // Repainting the list can move the scroll bar independently of the scan.
             scroller.scrollTop = current;
-            return {items: [], next: current, empty: false, atEnd: false};
+            const settled = Math.abs(scroller.scrollTop - current) > 3 ? Math.floor(scroller.scrollTop) : current;
+            return {items: [], next: settled, empty: false, atEnd: false};
         }
         const items = lists.filter(el => el.closest('.scrollable-y') === scroller)
             .flatMap(el => [...el.querySelectorAll('.chatlist-chat[data-peer-id]')]).map(row => ({
@@ -1567,8 +1792,8 @@ class WebEngine:
             is_forum: row.classList.contains('is-forum') || !!row.querySelector('.is-forum'),
             title: row.querySelector('.user-title, .peer-title')?.textContent.trim() || ''
         }));
-        const atEnd = current >= bottom - 1;
-        const next = advance && scroller && items.length ? Math.min(bottom, current + Math.max(1, scroller.clientHeight * .8)) : current;
+        const atEnd = current >= bottom - 2;
+        const next = advance && scroller && items.length ? Math.min(bottom, current + Math.max(1, Math.floor(scroller.clientHeight * .8))) : current;
         if (scroller && next > current) scroller.scrollTop = next;
         return {items, next, empty: !items.length && empty, atEnd};
     }"""

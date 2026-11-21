@@ -18,6 +18,7 @@ def main():
     mode.add_argument('--install-browser-deps', action='store_true', help='安装 Linux 浏览器系统依赖（需要管理员权限）')
     mode.add_argument('--doctor', action='store_true', help='检查本机运行环境，不连接 Telegram')
     mode.add_argument('--selftest', action='store_true', help='执行纯逻辑自检')
+    mode.add_argument('--notify-test', action='store_true', help='测试 Server酱微信推送')
     mode.add_argument('--version', action='store_true', help='显示版本')
     parser.add_argument('--browser', action='store_true', help='诊断时实际启动无界面浏览器')
     parser.add_argument('--account', help='只执行指定账号，与 --run 配合使用')
@@ -35,7 +36,7 @@ def main():
     elif args.install_browser or args.install_browser_deps:
         from playwright.__main__ import main as playwright_main
         sys.argv = ['playwright', 'install-deps' if args.install_browser_deps else 'install', 'chromium']
-        playwright_main()
+        return playwright_main() or 0
     elif args.doctor:
         from core.diagnostics import diagnose
         result = asyncio.run(diagnose(browser=args.browser))
@@ -47,10 +48,22 @@ def main():
     elif args.selftest:
         from checkin import selftest
         return selftest()
+    elif args.notify_test:
+        from core.config import load_config
+        from core.log import setup_logging
+        from core.state import load_state
+        from core import notifications
+        setup_logging()
+        result = notifications.send_preview(load_config(), load_state())
+        return 0 if result['ok'] else 1
     elif args.run or args.schedule:
         from checkin import main as checkin_main, scheduled_main
         sys.argv = ['checkin', *(['--schedule'] if args.schedule else []), *(['--account', args.account] if args.account else [])]
-        return asyncio.run(scheduled_main() if args.schedule else checkin_main()) or 0
+        try:
+            return asyncio.run(scheduled_main() if args.schedule else checkin_main(args.account)) or 0
+        except KeyboardInterrupt:
+            print('\n已中断')
+            return 130
     else:
         from gui import run
         run()

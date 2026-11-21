@@ -29,14 +29,15 @@ def append_history(account, r):
     """每条结果立刻追加进 history/年-月.csv，中途崩溃也不丢。"""
     try:
         HISTORY_DIR.mkdir(exist_ok=True)
-        path = HISTORY_DIR / f"{local_now():%Y-%m}.csv"
-        is_new = not path.exists()
+        ts = local_now()
+        path = HISTORY_DIR / f"{ts:%Y-%m}.csv"
+        is_new = not path.exists() or path.stat().st_size == 0
         detail = result_detail(r)
         with open(path, "a", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             if is_new:
                 w.writerow(["时间", "账号", "群聊", "状态", "详情"])
-            w.writerow([f"{local_now():%Y-%m-%d %H:%M:%S}", account, r["name"],
+            w.writerow([f"{ts:%Y-%m-%d %H:%M:%S}", account, r["name"],
                         status_of(r), detail])
     except Exception:
         log.exception("写入签到记录失败")

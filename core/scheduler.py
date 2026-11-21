@@ -2,8 +2,8 @@
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, time as dt_time, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import BASE_DIR
 from .config import validate_config
@@ -34,32 +34,41 @@ def write_runtime(value):
     atomic_write(STATE_PATH, json.dumps(value, ensure_ascii=False, indent=2))
 
 
+def _schedule_options(cfg):
+    raw = cfg.get('schedule') if isinstance(cfg, dict) else None
+    return {**DEFAULTS, **(raw if isinstance(raw, dict) else {})}
+
+
+def _target_time(current, tz, hhmm):
+    hour, minute = map(int, hhmm.split(':'))
+    return datetime.combine(current.date(), dt_time(hour, minute), tzinfo=tz)
+
+
 def describe(cfg, current=None):
-    options = {**DEFAULTS, **cfg.get('schedule', {})}
+    options = _schedule_options(cfg)
     try:
         runtime = read_runtime()
-        current = current or now(cfg)
-        current = current.astimezone(ZoneInfo(options['timezone']))
-        hour, minute = map(int, options['time'].split(':'))
-        target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        tz = ZoneInfo(options['timezone'])
+        current = (current or now(cfg)).astimezone(tz)
+        target = _target_time(current, tz, options['time'])
         claimed = runtime.get('last_date', '') >= current.date().isoformat()
         if claimed or (target <= current and not options['catch_up'] and (current-target).total_seconds() >= 60):
-            target += timedelta(days=1)
+            target = datetime.combine(current.date() + timedelta(days=1), target.time(), tzinfo=tz)
         next_run = (current if target < current else target).isoformat(timespec='seconds') if options['enabled'] else None
         return {'settings': options, 'next_run': next_run, 'last_run': runtime, 'error': ''}
-    except (ValueError, RuntimeError, KeyError) as error:
+    except (ValueError, RuntimeError, KeyError, ZoneInfoNotFoundError, OSError) as error:
         return {'settings': options, 'next_run': None, 'last_run': {}, 'error': str(error)}
 
 
 def is_due(cfg, runtime, current):
-    options = {**DEFAULTS, **cfg.get('schedule', {})}
+    options = _schedule_options(cfg)
     if not options['enabled']:
         return False
-    current = current.astimezone(ZoneInfo(options['timezone']))
+    tz = ZoneInfo(options['timezone'])
+    current = current.astimezone(tz)
     if runtime.get('last_date', '') >= current.date().isoformat():
         return False
-    hour, minute = map(int, options['time'].split(':'))
-    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    target = _target_time(current, tz, options['time'])
     delay = (current-target).total_seconds()
     return delay >= 0 and (options['catch_up'] or delay < 60)
 
@@ -68,7 +77,8 @@ def claim(cfg, job_id, current):
     runtime = read_runtime()
     if not is_due(cfg, runtime, current):
         return False
-    write_runtime({'last_date': current.astimezone(ZoneInfo(cfg.get('schedule', {}).get('timezone', DEFAULTS['timezone']))).date().isoformat(),
+    options = _schedule_options(cfg)
+    write_runtime({'last_date': current.astimezone(ZoneInfo(options['timezone'])).date().isoformat(),
                    'job_id': job_id, 'status': 'queued', 'started': current.isoformat(timespec='seconds'), 'error': ''})
     return True
 
@@ -120,8 +130,12 @@ class DailyScheduler:
             try:
                 runtime = read_runtime()
                 if runtime.get('status') in ('queued', 'running'):
-                    complete(runtime['job_id'], 'interrupted', '上次进程退出，今日自动任务不会重发；请核对已发送内容')
-            except RuntimeError as error:
+                    try:
+                        startup_cfg = self.read_config()
+                    except (Exception, SystemExit):
+                        startup_cfg = None
+                    complete(runtime['job_id'], 'interrupted', '上次进程退出，今日自动任务不会重发；请核对已发送内容', cfg=startup_cfg)
+            except (RuntimeError, OSError) as error:
                 self.error = str(error)
             while True:
                 await self.tick()

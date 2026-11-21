@@ -4,13 +4,14 @@ import re
 import math
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from . import BASE_DIR
 
 VALID_METHODS = ("text", "command", "command_button", "button_only", "image_text", "image_only")
-_BUTTON_MESSAGE = re.compile(
-    r"(?:https://)?t\.me/(?:(?:c/(?P<chat>[1-9]\d*))|(?P<username>[A-Za-z][A-Za-z0-9_]{2,}))"
-    r"/(?P<first>[1-9]\d*)(?:/(?P<second>[1-9]\d*))?(?:\?thread=(?P<thread>[1-9]\d*))?"
+_BUTTON_PATH = re.compile(
+    r"^/(?:(?:c/(?P<chat>[1-9]\d*))|(?P<username>[A-Za-z][A-Za-z0-9_]{2,}))"
+    r"/(?P<first>[1-9]\d*)(?:/(?P<second>[1-9]\d*))?$"
 )
 DEFAULT_SUCCESS_KW = ["签到成功", "打卡成功", "签到完成", "已签到", "成功"]
 DEFAULT_FAIL_KW = ["签到失败", "打卡失败", "失败", "禁言", "被禁", "封禁", "错误", "无法", "异常"]
@@ -65,19 +66,34 @@ def infer_method(g):
 
 def button_message_ref(value):
     """Parse a numeric ID or the peer, thread and message from a Telegram link."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
     if not isinstance(value, str):
         raise ValueError("请输入 Telegram 消息链接或数字消息 ID")
     value = value.strip()
     if re.fullmatch(r"[1-9]\d*", value):
         return value, None, None
-    match = _BUTTON_MESSAGE.fullmatch(value)
+    raw = value if re.match(r"^https?://", value, re.I) else "https://" + value
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() not in ("http", "https") or parsed.netloc.lower() != "t.me" or parsed.fragment:
+        raise ValueError("请输入 Telegram 消息链接或数字消息 ID")
+    match = _BUTTON_PATH.fullmatch(parsed.path)
     if not match:
         raise ValueError("请输入 Telegram 消息链接或数字消息 ID")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if any(k not in ("thread", "single") for k in query):
+        raise ValueError("请输入 Telegram 消息链接或数字消息 ID")
+    thread = None
+    if "thread" in query:
+        vals = query["thread"]
+        if len(vals) != 1 or not re.fullmatch(r"[1-9]\d*", vals[0]):
+            raise ValueError("请输入 Telegram 消息链接或数字消息 ID")
+        thread = vals[0]
     fields = match.groupdict()
     peer = '-' + fields['chat'] if fields['chat'] else '@' + fields['username'].lower()
-    if fields['second'] and fields['thread'] and fields['first'] != fields['thread']:
+    if fields['second'] and thread and fields['first'] != thread:
         raise ValueError("消息链接中的话题 ID 不一致")
-    return fields['second'] or fields['first'], peer, fields['first'] if fields['second'] else fields['thread']
+    return fields['second'] or fields['first'], peer, fields['first'] if fields['second'] else thread
 
 
 def group_actions(g):

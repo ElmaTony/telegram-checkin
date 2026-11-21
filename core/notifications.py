@@ -1,10 +1,13 @@
 """ServerChan: one bounded request per round; credentials never enter public config."""
 import asyncio
 import html
+import http.client
 import json
 import logging
 import os
 import re
+import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -65,17 +68,53 @@ def last_status():
         return {}
 
 
+def _truncate_utf8(text, max_bytes=28000):
+    encoded = str(text or '').encode('utf-8')
+    if len(encoded) <= max_bytes:
+        return str(text or '')
+    return encoded[:max_bytes].decode('utf-8', errors='ignore')
+
+
+def _error_kind(error):
+    cause = getattr(error, 'reason', error)
+    if isinstance(error, json.JSONDecodeError):
+        return '响应格式无效'
+    if isinstance(error, http.client.HTTPException):
+        return f'HTTP 传输异常（{type(error).__name__}）'
+    if isinstance(cause, (TimeoutError, socket.timeout)):
+        return '连接超时'
+    if isinstance(cause, ssl.SSLError):
+        return 'TLS 握手或证书异常'
+    if isinstance(cause, socket.gaierror):
+        return '域名解析失败'
+    if isinstance(cause, ConnectionRefusedError):
+        return '连接被拒绝（请检查本机代理）'
+    if isinstance(cause, ConnectionResetError):
+        return '连接被重置'
+    return type(cause).__name__
+
+
 def _post(key, title, description, *, short=''):
     validate_key(key)
     match = re.fullmatch(r'sctp(\d+)t[A-Za-z0-9]+', key)
     url = f'https://{match[1]}.push.ft07.com/send/{key}.send' if match else f'https://sctapi.ftqq.com/{key}.send'
-    fields = {'title': title[:32].replace('\n', ' '), 'desp': description[:30000], 'noip': '1'}
+    clean_title = re.sub(r'[\r\n]+', ' ', str(title or ''))[:32]
+    fields = {'title': clean_title, 'desp': _truncate_utf8(description, 28000), 'noip': '1'}
     if short:
-        fields['short'] = short[:64].replace('\n', ' ')
+        fields['short'] = re.sub(r'[\r\n]+', ' ', str(short))[:64]
     payload = urllib.parse.urlencode(fields).encode()
     req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'telegram-checkin'})
+    proxies = urllib.request.getproxies()
+    has_socks_only = any(str(v).lower().startswith('socks') for v in proxies.values()) and not any(
+        str(proxies.get(k, '')).lower().startswith(('http://', 'https://')) for k in ('https', 'http')
+    )
     try:
-        with urllib.request.urlopen(req, timeout=12) as response:
+        if has_socks_only:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            cm = opener.open(req, timeout=15)
+        else:
+            cm = urllib.request.urlopen(req, timeout=15)
+        with cm as response:
             data = json.loads(response.read(65536))
         if not isinstance(data, dict) or type(data.get('code')) is not int or data['code'] != 0:
             code = data.get('code') if isinstance(data, dict) else None
@@ -83,9 +122,10 @@ def _post(key, title, description, *, short=''):
         return {'ok': True, 'error': '', 'message': 'Server酱已接受，微信送达请以接收端为准'}
     except urllib.error.HTTPError as error:
         return {'ok': False, 'error': f'Server酱 HTTP {error.code}，请检查密钥、额度和服务状态'}
-    except (OSError, ValueError, urllib.error.URLError):
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as error:
         # Exception strings may contain a request URL, which contains the secret.
-        return {'ok': False, 'error': '推送网络请求失败或响应无效，请检查服务器网络'}
+        kind = _error_kind(error)
+        return {'ok': False, 'error': f'推送网络请求失败（{kind}），请检查服务器网络或代理设置'}
 
 
 def send(title, description, *, kind='round', cfg=None, short=''):
@@ -179,9 +219,9 @@ def _card_summary(description):
     return next((line.removeprefix('概览：') for line in description.splitlines() if line.startswith('概览：')), '')
 
 
-def round_message(cfg, state, *, only=None, chats=None, accounts=None, error='', cancelled=False, source='手动签到'):
+def round_message(cfg, state, *, only=None, chats=None, accounts=None, error='', cancelled=False, source='手动签到', today=None, prefix=''):
     current = now(cfg)
-    date = f'{current:%Y-%m-%d}'
+    date = today or f'{current:%Y-%m-%d}'
     counts = {'success': 0, 'unconfirmed': 0, 'failed': 0, 'pending': 0}
     rows, per_account = [], {}
     for account in cfg.get('accounts', []):
@@ -194,7 +234,7 @@ def round_message(cfg, state, *, only=None, chats=None, accounts=None, error='',
             if chats is not None and chat not in chats:
                 continue
             result = state.get('_last', {}).get(account['name'], {}).get(chat, {})
-            if result.get('date') != date:
+            if not isinstance(result, dict) or result.get('date') != date:
                 result = {}
             confirm = result.get('confirm') or ('success' if state.get(account['name'], {}).get(chat) == date else 'pending')
             confirm = confirm if confirm in counts else 'failed'
@@ -223,8 +263,9 @@ def round_message(cfg, state, *, only=None, chats=None, accounts=None, error='',
     else:
         title = f'✅ 签到完成：{counts["success"]}/{len(rows)}' if rows else '📋 签到结果：当前范围暂无会话'
     overview = f'概览：✅ 成功 {counts["success"]} · ⚠️ 待核对 {counts["unconfirmed"]} · ❌ 失败 {counts["failed"]} · ⏸ 未执行 {counts["pending"]}'
-    description = ['## 📋 签到结果', '', f'{current:%Y-%m-%d %H:%M:%S %Z} · {_md(source, 60)}',
-                   '', f'**共 {len(rows)} 个会话 · {len(per_account)} 个账号**', '', overview]
+    description = ([prefix, ''] if prefix else []) + [
+        '## 📋 签到结果', '', f'{current:%Y-%m-%d %H:%M:%S %Z} · {_md(source, 60)}',
+        '', f'**共 {len(rows)} 个会话 · {len(per_account)} 个账号**', '', overview]
     if shared:
         description.append(f'> 成功中含 {shared} 项共享完成，不重复计数。')
     if drafts:
@@ -263,13 +304,16 @@ def round_message(cfg, state, *, only=None, chats=None, accounts=None, error='',
 
 def send_preview(cfg, state):
     """Preview uses saved results and the configured account scope, never Telegram."""
-    title, description, _ = round_message(cfg, state, accounts=cfg.get('schedule', {}).get('accounts'), source='推送样式预览')
-    description = '> 此为样式预览，使用当前已保存结果，不触发签到。\n\n' + description
+    schedule = cfg.get('schedule') if isinstance(cfg.get('schedule'), dict) else {}
+    title, description, _ = round_message(
+        cfg, state, accounts=schedule.get('accounts'), source='推送样式预览',
+        prefix='> 此为样式预览，使用当前已保存结果，不触发签到。',
+    )
     return send('【预览】'+title, description, kind='test', cfg=cfg, short=_card_summary(description))
 
 
 async def notify_round(cfg, state, **kwargs):
-    options = cfg.get('notifications', {})
+    options = cfg.get('notifications') if isinstance(cfg.get('notifications'), dict) else {}
     if not options.get('enabled', False):
         return {'skipped': True}
     try:

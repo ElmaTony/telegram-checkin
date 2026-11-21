@@ -9,6 +9,8 @@ const state={page:'overview',status:null,selected:null,query:'',accountFilter:''
  history:null,historyFilter:{q:'',account:'',status:'',from:'',to:''},historyPage:1,stats:null,statsDays:30,logs:null,logLevel:'',logQuery:'',editor:null,
  chooser:{dialogs:[],folders:[],checked:new Set(),query:'',folder:'',loading:false,error:''},pendingPlan:null,pendingDelete:null,
  automation:null,automationDraft:null,automationKey:'',automationScope:'all',automationDirty:false,testingNotification:false};
+const reqSeq={status:0,history:0,stats:0,logs:0,nav:0};
+let composing=false;
 
 function syncExecutionButtons(){
  const busy=state.status?.busy,accounts=state.status?.accounts||[];
@@ -48,7 +50,8 @@ function render(){
  syncExecutionButtons();
  syncActivityRows();
  const nextInspector=main.querySelector('.inspector');
- if(evidenceOpen&&inspected===nextInspector?.dataset.inspectedKey)nextInspector.querySelector('details').open=true;
+ const details=nextInspector?.querySelector('details');
+ if(evidenceOpen&&inspected===nextInspector?.dataset.inspectedKey&&details)details.open=true;
  if(focused){const next=document.getElementById(focused);if(next){next.focus();if(typeof position==='number'&&next.setSelectionRange)next.setSelectionRange(position,position);}}
 }
 
@@ -70,8 +73,10 @@ function banner(){
 }
 
 async function refreshStatus(){
+ const seq=++reqSeq.status;
  try{
   const data=await api('/api/status');
+  if(seq!==reqSeq.status)return;
   const content=s=>JSON.stringify({today:s?.today,accounts:s?.accounts,busy:s?.busy,automation:s?.automation,notification:s?.notification});
   const changed=content(data)!==content(state.status);
   const previous=state.status?.job;
@@ -81,14 +86,14 @@ async function refreshStatus(){
   document.querySelector('#last-update').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
   if(previous&&previous.id===data.job?.id&&['queued','running','cancelling'].includes(previous.status)&&!data.busy){
    notify(data.job.status==='cancelled'?'任务已取消，已发出的消息请核对反馈':data.job.status==='failed'?data.job.error:'本轮执行结束，结果已更新',data.job.status==='failed');
-   if(data.job.mode==='probe'&&data.probe.result)showProbe(data.probe.result);
+   if(data.job.mode==='probe'&&data.probe?.result)showProbe(data.probe.result);
   }
   banner();
   syncExecutionButtons();
   syncActivityRows();
   if(state.page==='automation')syncAutomationRuntime();
-  if(changed&&state.page==='overview')render();
- }catch(error){document.querySelector('#connection').textContent='连接中断：'+error.message;document.querySelector('.connection-dot').classList.add('offline');}
+  if(changed&&state.page==='overview'&&!composing)render();
+ }catch(error){if(seq===reqSeq.status){document.querySelector('#connection').textContent='连接中断：'+error.message;document.querySelector('.connection-dot').classList.add('offline');}}
 }
 
 async function loadConfig(force=false){
@@ -120,6 +125,8 @@ async function loadAutomation(force=false){
 }
 function markAutomationDirty(){state.automationDirty=true;document.querySelector('#draft-indicator').hidden=false;main.querySelectorAll('.save-state').forEach(el=>el.textContent='有未保存修改');main.querySelector('[data-action="test-notification"]')?.setAttribute('disabled','');const reload=main.querySelector('[data-action="reload-automation"]');if(reload)reload.textContent='放弃修改并载入';}
 async function saveAutomation(){
+ if(!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(state.automationDraft.schedule.time||'')))throw new Error('定时签到时间必须为 HH:MM（00:00–23:59）');
+ if(!String(state.automationDraft.schedule.timezone||'').trim())throw new Error('请填写有效的运行时区');
  if(state.automationScope==='selected'&&!state.automationDraft.schedule.accounts.length)throw new Error('请至少勾选一个定时账号，或明确选择全部账号');
  await api('/api/automation',{...state.automationDraft,revision:state.automation.revision,...(state.automationKey?{sendkey:state.automationKey}:{})});
  await loadAutomation(true);
@@ -132,26 +139,32 @@ async function saveConfig(){
  if(!state.draft)return;
  const renames={};
  for(const a of state.draft.accounts){const old=state.origins.get(a);if(old&&old!==a.name)renames[old]=a.name;}
- await api('/api/config',{cfg:state.draft,revision:state.revision,renames});
+ const saved=await api('/api/config',{cfg:state.draft,revision:state.revision,renames});
+ if(state.automation){
+  if(state.automationDirty)state.automation.revision=saved.revision;
+  else {state.automation=null;state.automationDraft=null;}
+ }
  await loadConfig(true);await refreshStatus();render();notify('配置已保存');
 }
 
 const historyQuery=()=>new URLSearchParams({...state.historyFilter,page:state.historyPage,limit:100});
-async function loadHistory(){state.history=await api('/api/history?'+historyQuery());if(state.page==='history')render();}
-async function loadStats(){state.stats=await api('/api/stats?days='+state.statsDays);if(state.page==='stats')render();}
-async function loadLogs(){state.logs=(await api('/api/logs?'+new URLSearchParams({level:state.logLevel,q:state.logQuery}))).text;if(state.page==='logs')render();}
+async function loadHistory(){const seq=++reqSeq.history;const data=await api('/api/history?'+historyQuery());if(seq!==reqSeq.history)return;state.history=data;if(state.page==='history')render();}
+async function loadStats(){const seq=++reqSeq.stats;const data=await api('/api/stats?days='+state.statsDays);if(seq!==reqSeq.stats)return;state.stats=data;if(state.page==='stats')render();}
+async function loadLogs(){const seq=++reqSeq.logs;const data=await api('/api/logs?'+new URLSearchParams({level:state.logLevel,q:state.logQuery}));if(seq!==reqSeq.logs)return;state.logs=data.text;if(state.page==='logs')render();}
 async function navigate(page){
  if(!pages[page])page='overview';
+ const seq=++reqSeq.nav;
  state.page=page;location.hash=page;
  if(page==='accounts')await loadConfig();
  if(page==='automation')await loadAutomation();
+ if(seq!==reqSeq.nav)return;
  render();
  if(page==='history')await loadHistory();
  if(page==='stats')await loadStats();
  if(page==='logs')await loadLogs();
 }
 
-window.addEventListener('hashchange',()=>{const page=location.hash.slice(1);if(pages[page]&&page!==state.page)navigate(page).catch(error=>notify(error.message,true));});
+window.addEventListener('hashchange',()=>{const raw=location.hash.slice(1);const page=raw?(pages[raw]?raw:'overview'):'overview';if(page!==state.page)navigate(page).catch(error=>notify(error.message,true));});
 
 function showModal(html,label='操作窗口'){modal.setAttribute('aria-label',label);modal.innerHTML=html;if(!modal.open)modal.showModal();}
 function closeModal(){modal.close();state.editor=null;state.pendingPlan=null;state.pendingDelete=null;}
@@ -187,6 +200,26 @@ async function loadEditorTopics(refresh=false){
  finally{if(state.editor===editor&&editor.topicRequest===requestId){editor.topicsLoading=false;drawEditor();}}
 }
 
+function normalizeActions(actions,chat){
+ return actions.map(a=>{
+  const result={...a,method:a.method||'text'};
+  if(['image_text','image_only'].includes(result.method)&&!String(result.image||'').trim())throw new Error('图片签到必须配置图片路径');
+  if(result.method==='image_text'&&!lines(result.message).trim())throw new Error('图片＋文字签到必须配置说明文字');
+  if(result.method==='command_button'&&!(Array.isArray(result.click_button)?result.click_button.length:String(result.click_button||'').trim()))throw new Error('按钮签到必须配置按钮文字');
+  if(['command','command_button'].includes(result.method)&&!lines(result.message).trim())throw new Error('请填写口令');
+  if(result.method==='button_only'){
+   result.click_button=String(result.click_button||'').trim();
+   if(!result.click_button||/[\r\n]/.test(result.click_button))throw new Error('请填写一个按钮的完整文字');
+   result.button_message=String(result.button_message||'').trim();
+   if(String(chat||'').startsWith('-')&&!result.button_message)throw new Error('群聊的仅按钮签到需要指定消息链接或数字消息 ID');
+  }else delete result.button_message;
+  if(!['image_text','image_only'].includes(result.method))delete result.image;
+  if(!['command_button','button_only'].includes(result.method))delete result.click_button;
+  if(['image_only','button_only'].includes(result.method))delete result.message;
+  return result;
+ });
+}
+
 async function saveEditor(){
  const {group:g,actions,index}=state.editor,account=state.draft.accounts[state.accountIndex];
  if(state.editor.topicsLoading)throw new Error('正在识别发送位置，请稍候');
@@ -195,22 +228,7 @@ async function saveEditor(){
  g.chat=String(g.chat||'').trim().replace(/^#/,'');
  if(!/^-?\d+$|^@[A-Za-z0-9_]{3,}$/.test(g.chat))throw new Error('请输入有效的数字会话 ID 或 @用户名');
  if(account.groups.some((other,i)=>i!==index&&String(other.chat)===g.chat))throw new Error('这个会话已经存在，请在原会话中添加动作');
- const normalized=actions.map(a=>{
-  const result={...a,method:a.method||'text'};
-  if(['image_text','image_only'].includes(result.method)&&!String(result.image||'').trim())throw new Error('图片签到必须配置图片路径');
-  if(result.method==='command_button'&&!(Array.isArray(result.click_button)?result.click_button.length:String(result.click_button||'').trim()))throw new Error('按钮签到必须配置按钮文字');
-  if(['command','command_button'].includes(result.method)&&!lines(result.message).trim())throw new Error('请填写口令');
-  if(result.method==='button_only'){
-   result.click_button=String(result.click_button||'').trim();
-   if(!result.click_button||/[\r\n]/.test(result.click_button))throw new Error('请填写一个按钮的完整文字');
-   result.button_message=String(result.button_message||'').trim();
-   if(g.chat.startsWith('-')&&!result.button_message)throw new Error('群聊的仅按钮签到需要指定消息链接或数字消息 ID');
-  }else delete result.button_message;
-  if(!['image_text','image_only'].includes(result.method))delete result.image;
-  if(!['command_button','button_only'].includes(result.method))delete result.click_button;
-  if(['image_only','button_only'].includes(result.method))delete result.message;
-  return result;
- });
+ const normalized=normalizeActions(actions,g.chat);
  for(const key of ['method','message','image','click_button','button_message','actions'])delete g[key];
  if(normalized.length===1)Object.assign(g,normalized[0]);else g.actions=normalized;
  g.reply_mode??=state.draft.reply_mode||'reply_only';
@@ -305,7 +323,7 @@ async function onAction(el){
  if(action==='cancel'){await api('/api/cancel',{});await refreshStatus();}
  if(action==='probe')await startJob('probe',state.accountFilter?{account:state.accountFilter}:{});
  if(action==='probe-chat'){const row=selectedRow(el.dataset.key);if(!row)throw new Error('目标会话已改变，请刷新后重试');await startJob('probe',{account:row.account,chats:[row.chat]});}
- if(action==='recheck'){const row=selectedRow(el.dataset.key);await startJob('recheck',{account:row.account,chats:[row.chat]});}
+ if(action==='recheck'){const row=selectedRow(el.dataset.key);if(!row)throw new Error('目标会话已改变，请刷新后重试');await startJob('recheck',{account:row.account,chats:[row.chat]});}
  if(action==='edit-selected'){
   const row=selectedRow(el.dataset.key);if(!row)throw new Error('目标会话已改变，请重新选择');await loadConfig();
   const mappedIndex=state.draft.accounts.findIndex(a=>state.origins.get(a)===row.account);
@@ -346,29 +364,48 @@ async function onAction(el){
  }
  if(action==='choose-batch'){
   const chooserState=state.chooser,editor=state.editor;
+  if(chooserState.loading)return;
   const selected=state.chooser.dialogs.filter(d=>state.chooser.checked.has(String(d.id)));
   if(selected.some(d=>d.is_forum||String(d.id).startsWith('-')&&d.is_forum===undefined))throw new Error('论坛群需要逐个选择话题；请刷新列表后单独选用这些群。');
-  for(const dialog of selected.filter(d=>String(d.id).startsWith('-'))){
-   const info=await api('/api/topics?'+new URLSearchParams({account:state.origins.get(account),chat:String(dialog.id),title:dialog.title||'',folder:state.chooser.folder||''}));
-   if(!chooser.open||state.chooser!==chooserState||state.editor!==editor)return;
-   if(info.is_forum){dialog.is_forum=true;state.chooser.checked.delete(String(dialog.id));drawChooser();throw new Error('「'+dialog.title+'」是论坛群，请单独选择话题后添加。');}
+  chooserState.loading=true;chooserState.error='';drawChooser();
+  try{
+   for(const dialog of selected.filter(d=>String(d.id).startsWith('-'))){
+    const info=await api('/api/topics?'+new URLSearchParams({account:state.origins.get(account),chat:String(dialog.id),title:dialog.title||'',folder:state.chooser.folder||''}));
+    if(!chooser.open||state.chooser!==chooserState||state.editor!==editor)return;
+    if(info.is_forum){dialog.is_forum=true;state.chooser.checked.delete(String(dialog.id));throw new Error('「'+dialog.title+'」是论坛群，请单独选择话题后添加。');}
+   }
+   const existing=new Set(account.groups.map(g=>String(g.chat)));let added=0;
+   for(const id of state.chooser.checked){
+    if(existing.has(id))continue;
+    const dialog=state.chooser.dialogs.find(d=>String(d.id)===id);
+    const normalized=normalizeActions(state.editor.actions,id);
+    const g=copy(state.editor.group);
+    g.chat=id;g.title=dialog.title;g.folder=state.chooser.folder||'';g.is_forum=false;
+    for(const k of ['method','message','image','click_button','button_message','actions','primary','topic','topic_id'])delete g[k];
+    if(normalized.length===1)Object.assign(g,normalized[0]);else g.actions=normalized;
+    account.groups.push(g);existing.add(id);added++;
+   }
+   chooser.close();closeModal();markDirty();render();notify(`已加入 ${added} 个会话到草稿，请保存配置`);
+  }catch(error){
+   chooserState.error=error.message;
+   throw error;
+  }finally{
+   chooserState.loading=false;
+   if(state.chooser===chooserState&&chooser.open)drawChooser();
   }
-  const existing=new Set(account.groups.map(g=>String(g.chat)));let added=0;
-  for(const id of state.chooser.checked){if(existing.has(id))continue;const dialog=state.chooser.dialogs.find(d=>String(d.id)===id);const g=copy(state.editor.group);g.chat=id;g.title=dialog.title;g.folder=state.chooser.folder||'';g.is_forum=false;g.actions=copy(state.editor.actions);for(const k of ['method','message','image','click_button','button_message','primary','topic','topic_id'])delete g[k];account.groups.push(g);existing.add(id);added++;}
-  chooser.close();closeModal();markDirty();render();notify(`已加入 ${added} 个会话到草稿，请保存配置`);
  }
  if(action==='add-action'){state.editor.actions.push({method:'text',message:'签到'});drawEditor();}
  if(action==='remove-action'){state.editor.actions.splice(index,1);drawEditor();}
  if(action==='move-action-up'||action==='move-action-down'){const other=index+(action==='move-action-up'?-1:1);[state.editor.actions[index],state.editor.actions[other]]=[state.editor.actions[other],state.editor.actions[index]];drawEditor();}
  if(action==='inherit-keywords'){
-  const g=state.editor.group,other=state.draft.accounts.flatMap(a=>a.groups).find(x=>String(x.chat)===String(g.chat)&&(x.success_keywords?.length||x.fail_keywords?.length));if(!other)throw new Error('其他账号还没有为此会话设置专属判定词');g.success_keywords=copy(other.success_keywords||[]);g.fail_keywords=copy(other.fail_keywords||[]);drawEditor();
+  const g=state.editor.group,other=state.draft.accounts.filter((_,i)=>i!==state.accountIndex).flatMap(a=>a.groups).find(x=>String(x.chat)===String(g.chat)&&(x.success_keywords?.length||x.fail_keywords?.length));if(!other)throw new Error('其他账号还没有为此会话设置专属判定词');g.success_keywords=copy(other.success_keywords||[]);g.fail_keywords=copy(other.fail_keywords||[]);drawEditor();
  }
  if(action==='test-rule'){
   const group=state.editor?copy(state.editor.group):{};state.judgeGroup=group;
   // Keep the rule editor alive beneath its own independent chooser dialog.
   chooser.innerHTML=`<form id="judge-form"><div class="dialog-heading"><h2>判定词沙盒</h2>${button('close-chooser','返回规则编辑',{kind:'ghost'})}</div><p class="muted">粘贴机器人反馈，检查话术匹配。不会发送消息，也不代表消息已归属本账号。</p><label class="field">反馈原文<textarea name="text" rows="5" required></textarea></label><div id="judge-result" class="evidence-block" hidden></div><div class="dialog-actions"><button class="primary" type="submit">测试匹配</button></div></form>`;chooser.showModal();
  }
- if(action==='history-prev'||action==='history-next'){state.historyPage+=action==='history-prev'?-1:1;await loadHistory();}
+ if(action==='history-prev'||action==='history-next'){const prev=state.historyPage;state.historyPage=Math.max(1,prev+(action==='history-prev'?-1:1));try{await loadHistory();}catch(error){state.historyPage=prev;throw error;}}
  if(action==='history-reset'){state.historyFilter={q:'',account:'',status:'',from:'',to:''};state.historyPage=1;await loadHistory();}
  if(action==='export-history')await download('/api/history/download?'+historyQuery(),'checkin-history.csv');
  if(action==='download-logs')await download('/api/logs/download','checkin.log');
@@ -379,32 +416,54 @@ async function onAction(el){
  if(action==='import-config')document.querySelector('#config-file').click();
 }
 
+const inFlightActions=new Set(['save-config','save-automation','confirm-run','confirm-delete','cancel','login','history-prev','history-next']);
 document.addEventListener('click',event=>{
  const el=event.target.closest('button');if(!el||el.disabled)return;
  if(el.dataset.page){navigate(el.dataset.page).catch(e=>notify(e.message,true));return;}
  if(el.dataset.filter){state.filter=el.dataset.filter;render();return;}
- if(el.dataset.action)onAction(el).catch(error=>{const box=document.querySelector('#editor-error');if(modal.open&&box){box.textContent=error.message;box.hidden=false;}else notify(error.message,true);});
+ if(el.dataset.action){
+  const lockBtn=inFlightActions.has(el.dataset.action);
+  if(lockBtn)el.disabled=true;
+  onAction(el).catch(error=>{
+   if(chooser.open){
+    if(state.chooser&&chooser.querySelector('.chooser-list')){state.chooser.error=error.message;drawChooser();}
+    else notify(error.message,true);
+    return;
+   }
+   const box=document.querySelector('#editor-error');
+   if(modal.open&&box){box.textContent=error.message;box.hidden=false;box.scrollIntoView({block:'nearest'});}
+   else notify(error.message,true);
+  }).finally(()=>{if(lockBtn&&el.isConnected)el.disabled=false;});
+ }
+});
+
+document.addEventListener('compositionstart',()=>{composing=true;});
+document.addEventListener('compositionend',event=>{
+ composing=false;
+ const el=event.target;
+ if(el?.dataset?.control==='search'){state.query=el.value;render();}
+ if(el?.dataset?.control==='chooser-search'){state.chooser.query=el.value;const pos=el.selectionStart;drawChooser();const next=document.querySelector('#chooser-search');next?.focus();if(typeof pos==='number')next?.setSelectionRange(pos,pos);}
 });
 
 document.addEventListener('input',event=>{
  const el=event.target;
- if(el.dataset.schedule){const key=el.dataset.schedule;state.automationDraft.schedule[key]=key==='accounts'?[...el.selectedOptions].map(o=>o.value):el.type==='checkbox'?el.checked:el.value;markAutomationDirty();}
+ if(el.dataset.schedule){const key=el.dataset.schedule;state.automationDraft.schedule[key]=el.type==='checkbox'?el.checked:el.value;markAutomationDirty();}
  if(el.dataset.scheduleScope){state.automationScope=el.dataset.scheduleScope;state.automationDraft.schedule.accounts=state.automationScope==='all'?[]:(state.automationDraft.schedule.accounts.length?state.automationDraft.schedule.accounts:(state.status?.accounts||[]).map(a=>a.name));markAutomationDirty();render();}
  if(el.dataset.scheduleAccount){const names=new Set(state.automationDraft.schedule.accounts);el.checked?names.add(el.dataset.scheduleAccount):names.delete(el.dataset.scheduleAccount);state.automationDraft.schedule.accounts=[...names];markAutomationDirty();}
  if(el.dataset.notification){state.automationDraft.notifications[el.dataset.notification]=el.checked;markAutomationDirty();}
  if(el.id==='serverchan-key'){state.automationKey=el.value.trim();markAutomationDirty();}
- if(el.dataset.control==='search'){state.query=el.value;render();}
- if(el.dataset.control==='chooser-search'){state.chooser.query=el.value;const pos=el.selectionStart;drawChooser();const next=document.querySelector('#chooser-search');next.focus();next.setSelectionRange(pos,pos);}
+ if(el.dataset.control==='search'){state.query=el.value;if(!composing)render();}
+ if(el.dataset.control==='chooser-search'){state.chooser.query=el.value;if(!composing){const pos=el.selectionStart;drawChooser();const next=document.querySelector('#chooser-search');next?.focus();if(typeof pos==='number')next?.setSelectionRange(pos,pos);}}
  if(el.dataset.accountName!==undefined){state.draft.accounts[Number(el.dataset.accountName)].name=el.value;markDirty();}
  if(el.dataset.delay){const [type,side]=el.dataset.delay.split(':'),key=type+'_delay_seconds';const values=range(state.draft[key],type==='account'?[0,0]:[1,3]);values[Number(side)]=Number(el.value);state.draft[key]=values;markDirty();}
  if(el.dataset.global){const key=el.dataset.global;state.draft[key]=el.type==='checkbox'?el.checked:key.endsWith('_keywords')?words(el.value):el.type==='number'?Number(el.value):el.value;markDirty();}
- if(el.dataset.editor){const key=el.dataset.editor;state.editor.group[key]=el.type==='checkbox'?el.checked:key.endsWith('_keywords')?words(el.value):el.value;if(key==='topic')delete state.editor.group.topic_id;if(key==='chat'){delete state.editor.group.topic;delete state.editor.group.topic_id;delete state.editor.group.is_forum;state.editor.topics=null;state.editor.topicsError='';state.editor.topicRequest=null;state.editor.topicsLoading=false;}}
+ if(el.dataset.editor){const key=el.dataset.editor;state.editor.group[key]=el.type==='checkbox'?el.checked:key.endsWith('_keywords')?words(el.value):el.value;if(key==='topic')delete state.editor.group.topic_id;if(key==='chat'){const hadTopicUI=!!(state.editor.group.is_forum||state.editor.topics||state.editor.topicsError);delete state.editor.group.topic;delete state.editor.group.topic_id;delete state.editor.group.is_forum;state.editor.topics=null;state.editor.topicsError='';state.editor.topicRequest=null;state.editor.topicsLoading=false;state.editor.chatChanged=hadTopicUI;}}
  if(el.dataset.actionField){const key=el.dataset.actionField;const action=state.editor.actions[Number(el.dataset.index)];action[key]=['image','button_message'].includes(key)||key==='click_button'&&action.method==='button_only'?el.value:normalizeValue(el.value);}
 });
 
 document.addEventListener('change',event=>{
  const el=event.target;
- if(el.dataset.editor==='chat'&&/^-?\d+$/.test(el.value.trim().replace(/^#/,'')))loadEditorTopics().catch(e=>notify(e.message,true));
+ if(el.dataset.editor==='chat'){const v=el.value.trim().replace(/^#/,'');if(/^-?\d+$/.test(v))loadEditorTopics().catch(e=>notify(e.message,true));else if(state.editor?.chatChanged){state.editor.chatChanged=false;drawEditor();}}
  if(el.hasAttribute('data-topic-choice')){const topic=state.editor.topics?.topics.find(item=>item.id===el.value);if(topic){state.editor.group.topic=topic.title;state.editor.group.topic_id=topic.id;}else if(el.value!=='__existing'){delete state.editor.group.topic;delete state.editor.group.topic_id;}drawEditor();document.querySelector('#editor-topic')?.focus();}
  if(['kindFilter','methodFilter','structureFilter','systemFilter'].includes(el.dataset.classification)){state[el.dataset.classification]=el.value;render();}
  if(el.dataset.control==='account-filter'){state.accountFilter=el.value;render();}
@@ -416,22 +475,23 @@ document.addEventListener('change',event=>{
  if(el.dataset.systemPrimary!==undefined){state.draft.accounts[state.accountIndex].groups.filter(g=>g.share_group===el.dataset.systemPrimary).forEach(g=>{if(String(g.chat)===el.value)g.primary=true;else delete g.primary;});markDirty();}
  if(el.dataset.actionMethod!==undefined){state.editor.actions[Number(el.dataset.actionMethod)].method=el.value;drawEditor();}
  if(el.id==='theme'){localStorage.setItem('theme',el.value);applyTheme(el.value);}
- if(el.id==='config-file'&&el.files[0])el.files[0].text().then(text=>{const cfg=JSON.parse(text);if(!cfg||!Array.isArray(cfg.accounts))throw new Error('配置文件必须包含 accounts 数组');state.draft=cfg;state.origins=new WeakMap();cfg.accounts.forEach(a=>{a.groups??=[];if(state.cfg.accounts.some(old=>old.name===a.name))state.origins.set(a,a.name);});state.accountIndex=0;state.checkedGroups.clear();markDirty();render();notify('配置已导入草稿，保存前请核对账号与会话');}).catch(e=>notify(e.message,true));
+ if(el.id==='config-file'&&el.files[0]){const file=el.files[0];el.value='';file.text().then(text=>{const cfg=JSON.parse(text);if(!cfg||!Array.isArray(cfg.accounts))throw new Error('配置文件必须包含 accounts 数组');state.draft=cfg;state.origins=new WeakMap();cfg.accounts.forEach(a=>{a.groups??=[];if(state.cfg.accounts.some(old=>old.name===a.name))state.origins.set(a,a.name);});state.accountIndex=0;state.checkedGroups.clear();markDirty();render();notify('配置已导入草稿，保存前请核对账号与会话');}).catch(e=>notify(e.message,true));}
 });
 
 document.addEventListener('submit',event=>{
  const form=event.target;event.preventDefault();
  (async()=>{
-  if(form.id==='token-form'){sessionStorage.setItem('gui_token',document.querySelector('#token-input').value.trim());document.querySelector('#token-dialog').close();await loadConfig();await refreshStatus();render();}
+  if(form.id==='token-form'){sessionStorage.setItem('gui_token',document.querySelector('#token-input').value.trim());document.querySelector('#token-dialog').close();await Promise.allSettled([loadConfig(true),refreshStatus()]);if(state.page==='automation')await loadAutomation(true);if(state.page==='history')await loadHistory();if(state.page==='stats')await loadStats();if(state.page==='logs')await loadLogs();render();}
   if(form.id==='account-form'){const name=new FormData(form).get('name').trim();if(state.draft.accounts.some(a=>a.name.toLowerCase()===name.toLowerCase()))throw new Error('已有同名账号');state.draft.accounts.push({name,groups:[]});state.accountIndex=state.draft.accounts.length-1;markDirty();closeModal();render();}
   if(form.id==='group-form')await saveEditor();
   if(form.id==='history-filters'){state.historyFilter=Object.fromEntries(new FormData(form));state.historyPage=1;await loadHistory();}
   if(form.id==='log-filters'){const data=new FormData(form);state.logLevel=data.get('level');state.logQuery=data.get('q');await loadLogs();}
   if(form.id==='judge-form'){const result=await api('/api/judge',{text:new FormData(form).get('text'),group:state.judgeGroup,settings:{success_keywords:state.draft.success_keywords,fail_keywords:state.draft.fail_keywords}});const box=document.querySelector('#judge-result');box.hidden=false;box.textContent=({success:'匹配成功话术',failed:'匹配失败话术',unconfirmed:'没有匹配到判定词'})[result.confirm]+' · 命中：'+Object.values(result.hits).flat().join('、');}
- })().catch(error=>{const box=document.querySelector('#editor-error');if(form.id==='group-form'&&box){box.hidden=false;box.textContent=error.message;}else notify(error.message,true);});
+ })().catch(error=>{const box=document.querySelector('#editor-error');if(form.id==='group-form'&&box){box.hidden=false;box.textContent=error.message;box.scrollIntoView({block:'nearest'});}else notify(error.message,true);});
 });
 
 modal.addEventListener('cancel',event=>{if(state.editor){event.preventDefault();notify('请使用保存到草稿或取消按钮关闭，避免丢失规则修改');}});
+modal.addEventListener('close',()=>{state.editor=null;state.pendingPlan=null;state.pendingDelete=null;});
 main.addEventListener('toggle',event=>{if(event.target.matches('.global-settings'))state.globalOpen=event.target.open;},true);
 window.addEventListener('beforeunload',event=>{if(state.dirty||state.automationDirty){event.preventDefault();event.returnValue='';}});
 function applyTheme(theme){if(theme==='system')delete document.documentElement.dataset.theme;else document.documentElement.dataset.theme=theme;}

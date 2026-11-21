@@ -9,7 +9,8 @@ async def diagnose(browser=False):
     checks = []
     def add(name, ok, detail):
         checks.append({'name':name, 'ok':bool(ok), 'detail':detail})
-    add('web_resources', (RESOURCE_DIR/'gui.html').is_file() and (RESOURCE_DIR/'static/app.js').is_file(), '网页资源完整' if (RESOURCE_DIR/'gui.html').is_file() else '网页资源缺失')
+    web_ok = (RESOURCE_DIR/'gui.html').is_file() and (RESOURCE_DIR/'static/app.js').is_file()
+    add('web_resources', web_ok, '网页资源完整' if web_ok else '网页资源缺失')
     try:
         BASE_DIR.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryFile(dir=BASE_DIR) as stream:
@@ -38,6 +39,10 @@ async def diagnose(browser=False):
                     await instance.close()
     except Exception:
         add('browser_launch' if browser else 'playwright_driver', False, '浏览器或驱动不可运行，请检查安装和 Linux 系统依赖')
-    return {'ok':all(row['ok'] for row in checks), 'version':(RESOURCE_DIR/'VERSION').read_text(encoding='utf-8').strip(),
+    try:
+        version = (RESOURCE_DIR/'VERSION').read_text(encoding='utf-8').strip()
+    except OSError:
+        version = 'unknown'
+    return {'ok':all(row['ok'] for row in checks), 'version':version,
             'system':platform.system(), 'architecture':platform.machine(), 'data_home':str(BASE_DIR),
             'network_checked':False, 'checks':checks}

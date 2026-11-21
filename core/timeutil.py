@@ -7,7 +7,8 @@ _zone = ContextVar('checkin_timezone', default='Asia/Hong_Kong')
 
 
 def timezone_name(cfg):
-    return cfg.get('schedule', {}).get('timezone', 'Asia/Hong_Kong')
+    schedule = cfg.get('schedule') if isinstance(cfg, dict) else None
+    return (schedule if isinstance(schedule, dict) else {}).get('timezone') or 'Asia/Hong_Kong'
 
 
 def now(cfg=None):

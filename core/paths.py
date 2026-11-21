@@ -24,7 +24,11 @@ BASE_DIR = data_home().resolve()
 
 
 def visible_browser_available():
-    return sys.platform != 'linux' or bool(os.environ.get('DISPLAY', '').strip())
+    return sys.platform != 'linux' or bool(os.environ.get('DISPLAY', '').strip() or os.environ.get('WAYLAND_DISPLAY', '').strip())
+
+
+def account_lock_path(base_dir, safe_account_name):
+    return Path(base_dir) / 'data' / 'locks' / (str(safe_account_name).casefold() + '.lock')
 
 
 def login_command(account):

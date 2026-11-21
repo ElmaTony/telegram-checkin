@@ -19,19 +19,20 @@ _lock = threading.RLock()
 
 
 def load_state():
-    if STATE_PATH.exists() or STATE_PATH.with_suffix('.json.bak').exists():
-        for path in (STATE_PATH, STATE_PATH.with_suffix(".json.bak")):
-            try:
-                value = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(value, dict):
-                    raise ValueError("状态不是对象")
-                if path != STATE_PATH:
-                    log.warning("状态文件损坏，使用最近有效备份")
-                return value
-            except (OSError, ValueError):
-                continue
-        raise RuntimeError("state.json 与备份均无法读取，已停止执行以避免重复发送")
-    return {}
+    with _lock:
+        if STATE_PATH.exists() or STATE_PATH.with_suffix('.json.bak').exists():
+            for path in (STATE_PATH, STATE_PATH.with_suffix(".json.bak")):
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    if not isinstance(value, dict):
+                        raise ValueError("状态不是对象")
+                    if path != STATE_PATH:
+                        log.warning("状态文件损坏，使用最近有效备份")
+                    return value
+                except (OSError, ValueError):
+                    continue
+            raise RuntimeError("state.json 与备份均无法读取，已停止执行以避免重复发送")
+        return {}
 
 
 def save_state(state):
@@ -46,16 +47,17 @@ def mark_done(state, acc_name, chat, today):
     save_state(state)
 
 
-def record_last(state, account, chat, r, *, mark_date=None):
+def record_last(state, account, chat, r, *, mark_date=None, today=None):
     """记录今天每个群最近一次的结果（GUI 展示与重签用）。"""
-    today = local_now().strftime("%Y-%m-%d")
+    ts = local_now()
+    today = today or ts.strftime("%Y-%m-%d")
     last_acc = state.setdefault("_last", {}).setdefault(account, {})
-    for k in [k for k, v in last_acc.items() if v.get("date") != today]:
+    for k in [k for k, v in last_acc.items() if not isinstance(v, dict) or v.get("date") != today]:
         del last_acc[k]
     error = str(r.get("error") or "")
     detail = error or str(r.get("result_text") or "").strip() \
         or " | ".join(r.get("replies") or [])
-    last_acc[chat] = {"date": today, "time": f"{local_now():%H:%M:%S}",
+    last_acc[chat] = {"date": today, "time": f"{ts:%H:%M:%S}",
                       "confirm": r.get("confirm") or "failed", "detail": detail,
                       "error": error, "sent": r.get("sent"),
                       "draft_warning": r.get("draft_warning") or '',
@@ -96,6 +98,10 @@ def prune_state(cfg, state):
             del state[acc]
             changed = True
             continue
+        if not isinstance(state[acc], dict):
+            del state[acc]
+            changed = True
+            continue
         for chat in list(state[acc].keys()):
             if chat not in valid[acc]:
                 del state[acc][chat]
@@ -103,7 +109,7 @@ def prune_state(cfg, state):
     last = state.get("_last")
     if isinstance(last, dict):
         for acc in list(last.keys()):
-            if acc not in valid:
+            if acc not in valid or not isinstance(last[acc], dict):
                 del last[acc]
                 changed = True
                 continue

@@ -97,7 +97,7 @@ export function historyView(state){
 
 export function statsView(state){
  const data=state.stats,t=data?.total||{},sum=(t['成功']||0)+(t['未确认']||0)+(t['失败']||0);
- const rows=items=>items.map(item=>{const n=item['成功']+item['未确认']+item['失败'];return `<div class="stats-row"><span>${esc(item.date||item.account)}</span><div class="stats-track" role="img" aria-label="成功 ${item['成功']}，未确认 ${item['未确认']}，失败 ${item['失败']}">${[['成功','success'],['未确认','unconfirmed'],['失败','failed']].map(([key,cls])=>`<span class="${cls}" style="width:${n?100*item[key]/n:0}%"></span>`).join('')}</div><span class="stats-numbers">${item['成功']} / ${item['未确认']} / ${item['失败']}</span></div>`;}).join('');
+ const rows=items=>items.map(item=>{const ok=item['成功']||0,unc=item['未确认']||0,bad=item['失败']||0,n=ok+unc+bad;return `<div class="stats-row"><span>${esc(item.date||item.account)}</span><div class="stats-track" role="img" aria-label="成功 ${ok}，未确认 ${unc}，失败 ${bad}">${[[ok,'success'],[unc,'unconfirmed'],[bad,'failed']].map(([val,cls])=>`<span class="${cls}" style="width:${n?100*val/n:0}%"></span>`).join('')}</div><span class="stats-numbers">${ok} / ${unc} / ${bad}</span></div>`;}).join('');
  return heading('签到统计','按执行记录统计，包含手动重签次数。')+`<div class="toolbar"><label class="field">时间范围<select data-control="stats-days">${[7,30,90].map(n=>option(n,`近 ${n} 天`,state.statsDays)).join('')}</select></label><span class="muted">共 ${sum} 次记录 · 成功 ${sum?Math.round(100*(t['成功']||0)/sum):0}%</span></div><section class="panel"><div class="stats-legend"><span>成功 ${t['成功']||0}</span><span>未确认 ${t['未确认']||0}</span><span>失败 ${t['失败']||0}</span></div>${rows(data?.per_day||[])||empty('所选时间范围内没有记录')}<h3 class="section-gap">按账号</h3>${rows(data?.per_acc||[])}</section>`;
 }
 
