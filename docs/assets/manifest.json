@@ -1,14 +1,14 @@
 {
   "automation.png": {
-    "sha256": "a65eaaf0fdce62faa58ef2ff2f0c7c64bd666f6b2565b34dc41ae10df057be3c",
+    "sha256": "15c62da73c2374b180937a48eba4a1c40f253b0ea96e384f17de9cdae7ce4b08",
     "source": "anonymous API fixtures; visually reviewed"
   },
   "topic-picker.png": {
-    "sha256": "c67f23e93b26a72a527d7bf736322875681ba98bedf9519dfe4864eb512d8803",
+    "sha256": "b2d42ec4afb9dc657d2db07fd9305de58ab559282807a76c0d9f07bc1d5aa060",
     "source": "anonymous API fixtures; visually reviewed"
   },
   "workbench.png": {
-    "sha256": "41e5babead9b0386dfc267e971d54ee3376dab66479a1d799c3ac8ec30ec397a",
+    "sha256": "ff33540a6090bbf7c90a01c08b1a0ff34cf88a4d9f3b7e9e2bccce690eaf20f8",
     "source": "anonymous API fixtures; visually reviewed"
   }
 }
