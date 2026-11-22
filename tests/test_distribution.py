@@ -152,7 +152,7 @@ class DistributionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);(root/'dist').mkdir();(root/'docs'/'releases').mkdir(parents=True)
             (root/'VERSION').write_text('1.2.5')
-            (root/'docs'/'releases'/'v1.2.5.md').write_text('# v1.2.5\n\nFixture changes')
+            (root/'docs'/'releases'/'v1.2.5.md').write_text('# project v1.2.5\n\nFixture changes')
             package=root/'dist'/'telegram-checkin-v1.2.5.zip';package.write_bytes(b'fixture')
             checksum=package.with_suffix('.zip.sha256');checksum.write_text('fixture checksum')
             assets=[];methods=[];fault='digest'

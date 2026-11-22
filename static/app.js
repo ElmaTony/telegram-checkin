@@ -1,6 +1,6 @@
 import {api,download,notify,copy,esc,icon,button,pages,flatten,keyOf,methods,option,range,words,normalizeValue,actionsOf,lines,formatTime} from './core.js';
 import {accountsView,groupEditor,historyView,statsView,logsView} from './views.js';
-import {automationView} from './automation.js';
+import {automationView,parseTimeParts,renderTimezoneList,tzOffset,timePopoverHtml,timezonePopoverHtml} from './automation.js';
 import {workbench} from './workbench.js';
 
 const main=document.querySelector('#main'),modal=document.querySelector('#modal'),chooser=document.querySelector('#chooser');
@@ -8,7 +8,8 @@ const state={page:'overview',status:null,selected:null,query:'',accountFilter:''
  cfg:null,draft:null,revision:null,dirty:false,origins:new WeakMap(),accountIndex:0,checkedGroups:new Set(),globalOpen:false,
  history:null,historyFilter:{q:'',account:'',status:'',from:'',to:''},historyPage:1,stats:null,statsDays:30,logs:null,logLevel:'',logQuery:'',editor:null,
  chooser:{dialogs:[],folders:[],checked:new Set(),query:'',folder:'',loading:false,error:''},pendingPlan:null,pendingDelete:null,
- automation:null,automationDraft:null,automationKey:'',automationScope:'all',automationDirty:false,testingNotification:false};
+ automation:null,automationDraft:null,automationKey:'',automationScope:'all',automationDirty:false,testingNotification:false,
+ openPicker:null,tzQuery:'',tzShowAll:false};
 const reqSeq={status:0,history:0,stats:0,logs:0,nav:0};
 let composing=false;
 
@@ -151,9 +152,53 @@ const historyQuery=()=>new URLSearchParams({...state.historyFilter,page:state.hi
 async function loadHistory(){const seq=++reqSeq.history;const data=await api('/api/history?'+historyQuery());if(seq!==reqSeq.history)return;state.history=data;if(state.page==='history')render();}
 async function loadStats(){const seq=++reqSeq.stats;const data=await api('/api/stats?days='+state.statsDays);if(seq!==reqSeq.stats)return;state.stats=data;if(state.page==='stats')render();}
 async function loadLogs(){const seq=++reqSeq.logs;const data=await api('/api/logs?'+new URLSearchParams({level:state.logLevel,q:state.logQuery}));if(seq!==reqSeq.logs)return;state.logs=data.text;if(state.page==='logs')render();}
+function closePickerDom(){
+ state.openPicker=null;
+ main.querySelectorAll('.picker-popover').forEach(p=>p.remove());
+ main.querySelectorAll('.picker-wrap.is-open').forEach(w=>w.classList.remove('is-open'));
+ main.querySelectorAll('.picker-trigger[aria-expanded="true"]').forEach(b=>b.setAttribute('aria-expanded','false'));
+}
+function scrollPickerSelected(){
+ main.querySelectorAll('.time-col-list,.tz-list').forEach(box=>{
+  const item=box.querySelector('[data-selected="true"]');
+  if(item)box.scrollTop=Math.max(0,item.offsetTop-box.clientHeight/2+item.clientHeight/2);
+ });
+}
+function openPickerDom(kind,focusSearch=false){
+ closePickerDom();
+ const wrap=main.querySelector(`.picker-wrap[data-picker="${kind}"]`);
+ if(!wrap||!state.automationDraft)return;
+ state.openPicker=kind;
+ if(kind==='timezone'){state.tzQuery='';state.tzShowAll=false;}
+ wrap.classList.add('is-open');
+ wrap.querySelector('.picker-trigger')?.setAttribute('aria-expanded','true');
+ const html=kind==='time'?timePopoverHtml(state.automationDraft.schedule.time):timezonePopoverHtml(state.automationDraft.schedule.timezone,state.tzQuery,state.tzShowAll);
+ wrap.insertAdjacentHTML('beforeend',html);
+ scrollPickerSelected();
+ if(kind==='timezone'&&focusSearch)wrap.querySelector('#tz-search')?.focus();
+}
+function togglePicker(kind){
+ if(state.openPicker===kind)closePickerDom();
+ else openPickerDom(kind,kind==='timezone');
+}
+function syncTimePickerDom(value){
+ const inputEl=main.querySelector('#schedule-time');
+ if(inputEl)inputEl.value=value;
+ const preview=main.querySelector('.time-popover .picker-preview');
+ if(preview)preview.textContent=value;
+ const {hour,minute}=parseTimeParts(value);
+ main.querySelectorAll('.time-preset').forEach(btn=>btn.classList.toggle('active',btn.dataset.time===value));
+ main.querySelectorAll('[data-time-col="hour"] .time-cell').forEach(btn=>{
+  const on=btn.dataset.hour===hour;btn.classList.toggle('active',on);if(on)btn.dataset.selected='true';else delete btn.dataset.selected;
+ });
+ main.querySelectorAll('[data-time-col="minute"] .time-cell').forEach(btn=>{
+  const on=btn.dataset.minute===minute;btn.classList.toggle('active',on);if(on)btn.dataset.selected='true';else delete btn.dataset.selected;
+ });
+}
 async function navigate(page){
  if(!pages[page])page='overview';
  const seq=++reqSeq.nav;
+ state.openPicker=null;
  state.page=page;location.hash=page;
  if(page==='accounts')await loadConfig();
  if(page==='automation')await loadAutomation();
@@ -290,8 +335,31 @@ async function removeAccount(index){
 
 async function onAction(el){
  if(el.dataset.action==='go-automation')return navigate('automation');
- if(el.dataset.action==='save-automation')return saveAutomation();
- if(el.dataset.action==='reload-automation'){await loadAutomation(true);render();return;}
+ if(el.dataset.action==='save-automation'){state.openPicker=null;return saveAutomation();}
+ if(el.dataset.action==='reload-automation'){state.openPicker=null;await loadAutomation(true);render();return;}
+ if(el.dataset.action==='toggle-time-picker'){togglePicker('time');return;}
+ if(el.dataset.action==='toggle-tz-picker'){togglePicker('timezone');return;}
+ if(el.dataset.action==='close-picker'){closePickerDom();return;}
+ if(el.dataset.action==='pick-time'){
+  state.automationDraft.schedule.time=el.dataset.time;
+  markAutomationDirty();state.openPicker=null;render();return;
+ }
+ if(el.dataset.action==='pick-hour'||el.dataset.action==='pick-minute'){
+  const parts=parseTimeParts(state.automationDraft.schedule.time);
+  const next=el.dataset.action==='pick-hour'?`${el.dataset.hour}:${parts.minute}`:`${parts.hour}:${el.dataset.minute}`;
+  state.automationDraft.schedule.time=next;
+  markAutomationDirty();syncTimePickerDom(next);return;
+ }
+ if(el.dataset.action==='pick-timezone'){
+  state.automationDraft.schedule.timezone=el.dataset.tz;
+  markAutomationDirty();state.openPicker=null;state.tzQuery='';state.tzShowAll=false;render();return;
+ }
+ if(el.dataset.action==='tz-show-all'){
+  state.tzShowAll=true;
+  const list=main.querySelector('.tz-list');
+  if(list)list.innerHTML=renderTimezoneList(state.automationDraft.schedule.timezone,state.tzQuery,true);
+  return;
+ }
  if(el.dataset.action==='test-notification'){
   state.testingNotification=true;el.disabled=true;
   try{const result=await api('/api/notifications/test',{});notify(result.message);}
@@ -418,6 +486,9 @@ async function onAction(el){
 
 const inFlightActions=new Set(['save-config','save-automation','confirm-run','confirm-delete','cancel','login','history-prev','history-next']);
 document.addEventListener('click',event=>{
+ if(state.openPicker&&!event.target.closest('.picker-wrap'))closePickerDom();
+ if(event.target.id==='schedule-time'&&state.openPicker!=='time'){openPickerDom('time',false);return;}
+ if(event.target.id==='schedule-timezone'&&state.openPicker!=='timezone'){openPickerDom('timezone',false);return;}
  const el=event.target.closest('button');if(!el||el.disabled)return;
  if(el.dataset.page){navigate(el.dataset.page).catch(e=>notify(e.message,true));return;}
  if(el.dataset.filter){state.filter=el.dataset.filter;render();return;}
@@ -437,17 +508,48 @@ document.addEventListener('click',event=>{
  }
 });
 
+document.addEventListener('keydown',event=>{
+ if(event.key==='Escape'&&state.openPicker)closePickerDom();
+});
+document.addEventListener('focusout',event=>{
+ const el=event.target;
+ if(el?.id==='schedule-time'){
+  const m=/^(\d{1,2}):(\d{1,2})$/.exec(el.value.trim());
+  if(m){
+   const h=Number(m[1]),min=Number(m[2]);
+   if(h>=0&&h<=23&&min>=0&&min<=59){
+    const pad=`${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}`;
+    if(pad!==el.value){el.value=pad;state.automationDraft.schedule.time=pad;syncTimePickerDom(pad);markAutomationDirty();}
+   }
+  }
+ }
+});
+
 document.addEventListener('compositionstart',()=>{composing=true;});
 document.addEventListener('compositionend',event=>{
  composing=false;
  const el=event.target;
  if(el?.dataset?.control==='search'){state.query=el.value;render();}
+ if(el?.dataset?.control==='tz-search'){state.tzQuery=el.value;const list=main.querySelector('.tz-list');if(list)list.innerHTML=renderTimezoneList(state.automationDraft.schedule.timezone,state.tzQuery,state.tzShowAll);}
  if(el?.dataset?.control==='chooser-search'){state.chooser.query=el.value;const pos=el.selectionStart;drawChooser();const next=document.querySelector('#chooser-search');next?.focus();if(typeof pos==='number')next?.setSelectionRange(pos,pos);}
 });
 
 document.addEventListener('input',event=>{
  const el=event.target;
- if(el.dataset.schedule){const key=el.dataset.schedule;state.automationDraft.schedule[key]=el.type==='checkbox'?el.checked:el.value;markAutomationDirty();}
+ if(el.dataset.schedule){
+  const key=el.dataset.schedule;
+  state.automationDraft.schedule[key]=el.type==='checkbox'?el.checked:el.value;
+  if(key==='timezone'){
+   const badge=main.querySelector('[data-tz-badge]');
+   if(badge){const off=tzOffset(el.value);badge.textContent=off;badge.hidden=!off;}
+  }
+  if(key==='time'&&state.openPicker==='time')syncTimePickerDom(el.value);
+  markAutomationDirty();
+ }
+ if(el.dataset.control==='tz-search'){
+  state.tzQuery=el.value;
+  if(!composing){const list=main.querySelector('.tz-list');if(list)list.innerHTML=renderTimezoneList(state.automationDraft.schedule.timezone,state.tzQuery,state.tzShowAll);}
+ }
  if(el.dataset.scheduleScope){state.automationScope=el.dataset.scheduleScope;state.automationDraft.schedule.accounts=state.automationScope==='all'?[]:(state.automationDraft.schedule.accounts.length?state.automationDraft.schedule.accounts:(state.status?.accounts||[]).map(a=>a.name));markAutomationDirty();render();}
  if(el.dataset.scheduleAccount){const names=new Set(state.automationDraft.schedule.accounts);el.checked?names.add(el.dataset.scheduleAccount):names.delete(el.dataset.scheduleAccount);state.automationDraft.schedule.accounts=[...names];markAutomationDirty();}
  if(el.dataset.notification){state.automationDraft.notifications[el.dataset.notification]=el.checked;markAutomationDirty();}

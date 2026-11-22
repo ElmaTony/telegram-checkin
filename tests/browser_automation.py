@@ -49,7 +49,21 @@ async def main():
   await page.get_by_role('heading',name='定时与微信通知',exact=True).wait_for()
   assert await page.locator('#serverchan-key').input_value()==''
   await page.locator('[data-schedule="enabled"]').check()
+  await page.locator('[data-action="toggle-time-picker"]').click()
+  await page.locator('.time-popover').wait_for(state='visible')
+  await page.locator('[data-action="pick-hour"][data-hour="08"]').click()
+  await page.locator('[data-action="pick-minute"][data-minute="30"]').click()
+  assert await page.get_by_label('每天执行时间',exact=True).input_value()=='08:30'
+  await page.locator('[data-action="close-picker"]').click()
   await page.get_by_label('每天执行时间',exact=True).fill('00:10')
+  await page.locator('[data-action="toggle-tz-picker"]').click()
+  await page.locator('.tz-popover').wait_for(state='visible')
+  assert await page.locator('[data-action="pick-timezone"][data-tz="Asia/Tokyo"]').is_visible()
+  assert await page.locator('[data-action="pick-timezone"][data-tz="America/New_York"]').is_visible()
+  await page.locator('#tz-search').fill('纽约')
+  await page.locator('[data-action="pick-timezone"][data-tz="America/New_York"]').click()
+  assert await page.get_by_label('运行时区',exact=True).input_value()=='America/New_York'
+  await page.get_by_label('运行时区',exact=True).fill('Asia/Hong_Kong')
   await page.get_by_role('radio',name='指定账号',exact=True).check()
   await page.get_by_role('checkbox',name='A',exact=True).uncheck()
   await page.get_by_role('checkbox',name='B',exact=True).uncheck()

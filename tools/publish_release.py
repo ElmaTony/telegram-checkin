@@ -158,9 +158,11 @@ def main():
         remove_verified(verified)
         return
     version=(ROOT/'VERSION').read_text(encoding='utf-8').strip();tag='v'+version
+    repo_name=repository.split('/')[-1]
+    release_title=f'{repo_name} {tag}'
     notes=(ROOT/'docs'/'releases'/f'{tag}.md').read_text(encoding='utf-8')
-    if not notes.startswith('# '+tag):
-        raise RuntimeError('发行说明标题与 VERSION 不匹配')
+    if not notes.startswith(f'# {release_title}'):
+        raise RuntimeError(f'发行说明标题必须以 "# {release_title}" 开头')
     releases=api('GET',base+'/releases?per_page=100')
     existing=next((item for item in releases if item['tag_name']==tag),None)
     if existing and not existing['draft']:
@@ -184,13 +186,13 @@ def main():
     else:
         subprocess.run(['git','tag','-a',tag,'-m',f'Release {tag}'],cwd=ROOT,check=True)
     subprocess.run(['git','push','origin',tag],cwd=ROOT,check=True)
-    release=existing or api('POST',base+'/releases',{'tag_name':tag,'target_commitish':commit,'name':f'Telegram 签到 {tag}','body':notes,'draft':True,'prerelease':False})
+    release=existing or api('POST',base+'/releases',{'tag_name':tag,'target_commitish':commit,'name':release_title,'body':notes,'draft':True,'prerelease':False})
     upload_assets(api, release, assets)
     staged=api('GET',base+'/releases/'+str(release['id']))
     if {item['name'] for item in staged['assets']} != {path.name for path in assets}:
         raise RuntimeError('草稿中存在非预期附件，已停止，未正式发布')
     verified_packages(assets,staged['assets'],root=ROOT)
-    published=api('PATCH',base+'/releases/'+str(release['id']),{'draft':False,'body':notes})
+    published=api('PATCH',base+'/releases/'+str(release['id']),{'draft':False,'name':release_title,'body':notes})
     confirmed=api('GET',base+'/releases/'+str(published['id']))
     if confirmed['draft'] or confirmed['tag_name']!=tag:
         raise RuntimeError('发行版尚未确认，保留本地包')
