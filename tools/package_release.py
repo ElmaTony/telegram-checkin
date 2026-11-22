@@ -12,7 +12,7 @@ FILES = ('VERSION', 'CHANGELOG.md', 'README.md', 'README_EN.md', 'LICENSE', '.gi
          'docs/CLOUD.md', 'docs/CONFIGURATION.md',
          'docs/assets/icon.svg', 'docs/assets/workbench.png', 'docs/assets/automation.png', 'docs/assets/topic-picker.png', 'docs/assets/manifest.json')
 DIRECTORIES = ('core', 'static', 'tests', 'tools', 'deploy', '.github')
-SUFFIXES = {'.py', '.js', '.css', '.html', '.txt', '.md', '.yml', '.yaml', '.service', '.example', '.sh'}
+SUFFIXES = {'.py', '.js', '.css', '.html', '.svg', '.txt', '.md', '.yml', '.yaml', '.service', '.example', '.sh'}
 SECRETS = re.compile(rb'\b(?:SCT[A-Za-z0-9]{16,}|sctp\d+t[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b')
 
 

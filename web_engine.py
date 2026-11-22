@@ -20,7 +20,9 @@ import urllib.parse
 import urllib.request
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 from core.config import safe_name
@@ -28,6 +30,7 @@ from core.logic import button_message_ref
 from core.locks import FileLock
 from core.storage import atomic_write
 from core.paths import BASE_DIR, account_lock_path, configure_browser_path, visible_browser_available
+from core.timeutil import timezone_name
 
 log = logging.getLogger("checkin.web")
 
@@ -146,6 +149,7 @@ class WebEngine:
         self._profile_lock = None
         self._login_verified = False
         self._self_peer = None
+        self._last_send_confirmed_by_reply = False
 
     # ---------- 基础 ----------
 
@@ -951,26 +955,46 @@ class WebEngine:
         deadline = time.monotonic() + 12
         existing = set(self.last_sent_mids)
         observed_ids = set()
+        confirmed_aliases = set()
+        self._last_send_confirmed_by_reply = False
+        peer = str(boundary.get('peer') or '')
+        private_chat = peer.isdigit()
+        seen = set(str(m) for m in boundary.get('seen', ()))
         # Topic views may rebuild after Enter. Observe until an ID arrives, without
         # resending; the old three-second deadline ended while the view was loading.
         while time.monotonic() < deadline:
-            if boundary.get('peer'):
-                observed = await self.page.evaluate(self._IN_COLLECT_JS, {'peer': boundary['peer'], 'reset': False})
-                candidates = [record for record in observed.get('items', [])
-                              if record.get('out') and record['mid'] not in boundary.get('seen', set())
-                              and record['mid'] not in existing
-                              and record.get('ts', 0) >= int(boundary.get('cutoff', time.time())) - 5]
+            if peer:
+                observed = await self.page.evaluate(self._IN_COLLECT_JS, {'peer': peer, 'reset': False})
+                cutoff = int(boundary.get('cutoff', time.time())) - 5
+                items = observed.get('items', [])
+                candidates = [record for record in items
+                              if record.get('out') and str(record['mid']) not in seen
+                              and str(record['mid']) not in existing
+                              and record.get('ts', 0) >= cutoff]
                 if candidates:
                     observed_ids.update(str(record['mid']) for record in candidates)
                     self.last_sent_mids.update(observed_ids)
                 for old, new in observed.get('aliases', []):
-                    if str(old) in observed_ids:
-                        observed_ids.add(str(new))
-                        self.last_sent_mids.add(str(new))
-                if any(not record.get('pending') for record in candidates):
+                    old_s, new_s = str(old), str(new)
+                    if old_s in observed_ids:
+                        observed_ids.add(new_s)
+                        self.last_sent_mids.add(new_s)
+                        if '.' not in new_s:
+                            confirmed_aliases.add(new_s)
+                if any(not record.get('pending') for record in candidates) or confirmed_aliases:
+                    return
+                if private_chat and observed_ids and any(
+                    not record.get('out') and not record.get('pending')
+                    and str(record.get('mid', '')) not in seen
+                    and record.get('ts', 0) >= cutoff
+                    for record in items
+                ):
+                    # Bots in private chats frequently auto-delete our command in the same
+                    # update batch as their reply before Web K upgrades the temporary mid.
+                    self._last_send_confirmed_by_reply = True
                     return
             mid = await self._last_out_mid()
-            if not boundary.get('peer') and mid and str(mid) != str(pre_mid):
+            if not peer and mid and str(mid) != str(pre_mid):
                 self.last_sent_mids.add(str(mid))
                 return
             await asyncio.sleep(0.12)
@@ -1265,6 +1289,32 @@ class WebEngine:
         return found[0].el;
     }"""
 
+    _EXISTING_BUTTON_DIAG_JS = r"""({peer, mid, label, earliest, selectors}) => {
+        const normalize = value => String(value || '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F]/g,'').replace(/\s+/g,' ').trim();
+        const isSafeButton = el => el.matches('button:not([href], [disabled], [aria-disabled="true"], .is-disabled)') &&
+            !el.querySelector('.reply-markup-button-icon, a, [href]');
+        const needle = normalize(label);
+        const rows = [...document.querySelectorAll('.bubbles .bubble.is-in[data-mid]')].filter(b => b.dataset.peerId === peer && b.checkVisibility());
+        const inspect = bubble => [...bubble.querySelectorAll(selectors)].filter(el => {
+            if (!el.checkVisibility() || el.parentElement?.closest(selectors)) return false;
+            const text = (el.querySelector('.reply-markup-button-text') || el).cloneNode(true);
+            text.querySelectorAll('img[alt]').forEach(img => img.replaceWith(img.alt));
+            return normalize(text.textContent) === needle;
+        }).map(el => ({safe: isSafeButton(el), mid: bubble.dataset.mid, ts: Number(bubble.dataset.timestamp || 0)}));
+        const inScope = rows.filter(b => mid ? b.dataset.mid === mid : Number(b.dataset.timestamp) >= earliest - 5);
+        const scopeMatches = inScope.flatMap(inspect);
+        const safeInScope = scopeMatches.filter(m => m.safe);
+        const unsafeInScope = scopeMatches.filter(m => !m.safe);
+        const olderSafe = mid ? [] : rows.filter(b => Number(b.dataset.timestamp) < earliest - 5).flatMap(inspect).filter(m => m.safe);
+        olderSafe.sort((a, b) => b.ts - a.ts);
+        return {
+            midFound: mid ? inScope.length > 0 : null,
+            duplicateSafe: safeInScope.length >= 2,
+            unsafeCount: unsafeInScope.length,
+            latestOlderTs: olderSafe.length ? olderSafe[0].ts : null,
+        };
+    }"""
+
     async def click_existing_button(self, label, reference, earliest):
         """Click one incoming message's inline button within the verified conversation."""
         await self.assert_destination()
@@ -1290,7 +1340,21 @@ class WebEngine:
         try:
             handle = await self.page.wait_for_function(self._EXISTING_BUTTON_JS, arg=args, timeout=5000)
         except PlaywrightTimeoutError as error:
-            raise RuntimeError("没有找到唯一可点的签到按钮，请核对消息位置和按钮完整文字") from error
+            reason = f"没有找到唯一可点的签到按钮「{label}」，请核对消息位置和按钮完整文字"
+            try:
+                diag = await self.page.evaluate(self._EXISTING_BUTTON_DIAG_JS, args)
+                if mid and diag.get('midFound') is False:
+                    reason = f"未找到指定的按钮消息（ID {mid}），请核对按钮消息链接或数字消息 ID"
+                elif diag.get('duplicateSafe'):
+                    reason = f"同一条消息中存在多个同名按钮「{label}」，为防误点已停止"
+                elif diag.get('unsafeCount'):
+                    reason = f"找到按钮「{label}」，但它是网址或不可点击按钮，已跳过"
+                elif diag.get('latestOlderTs'):
+                    when = datetime.fromtimestamp(diag['latestOlderTs'], ZoneInfo(timezone_name(self.cfg))).strftime('%Y-%m-%d %H:%M')
+                    reason = f"今天尚未收到包含按钮「{label}」的新消息（最近匹配消息时间 {when}），未点击历史按钮；若需点击固定旧消息，请在规则中填写按钮消息链接或 ID"
+            except Exception:
+                pass
+            raise RuntimeError(reason) from error
         try:
             button = handle.as_element()
             await self.assert_destination()
@@ -1528,6 +1592,7 @@ class WebEngine:
         await self.assert_destination()
         deadline, aliases = time.monotonic() + seconds, []
         data = {'items': []}
+        stalled = 0
         while True:
             data = await self.page.evaluate(self._IN_COLLECT_JS, {'peer':known['peer'], 'reset':False})
             aliases.extend(data.get('aliases', []))
@@ -1537,17 +1602,24 @@ class WebEngine:
             previous = await self.page.evaluate('''peer => [...document.querySelectorAll('.bubbles .bubble[data-mid]')].filter(b=>b.dataset.peerId===peer).map(b=>b.dataset.mid).join(',')''', known['peer'])
             moved = await self.page.evaluate('''() => {
                 const scroller=[...document.querySelectorAll('.bubbles .bubbles-scrollable')].find(e=>e.checkVisibility());
-                if(!scroller)return false;
-                scroller.scrollTop=0;scroller.dispatchEvent(new Event('scroll'));return true;
+                if(!scroller)return {ok:false, atTop:true, scrollable:false};
+                const scrollable = scroller.scrollHeight > scroller.clientHeight + 10;
+                const atTop = scroller.scrollTop <= 1;
+                scroller.scrollTop=0;scroller.dispatchEvent(new Event('scroll'));
+                return {ok:true, atTop, scrollable};
             }''')
-            if not moved:
+            if not moved.get('ok'):
                 break
             try:
                 await self.page.wait_for_function('''({peer,previous}) => [...document.querySelectorAll('.bubbles .bubble[data-mid]')].filter(b=>b.dataset.peerId===peer).map(b=>b.dataset.mid).join(',')!==previous''',
                     arg={'peer':known['peer'], 'previous':previous}, timeout=max(1,min(700,int((deadline-time.monotonic())*1000))))
+                stalled = 0
             except Exception:
                 if self.page.is_closed():
                     raise
+                stalled += 1
+                if moved.get('atTop') and (not moved.get('scrollable') or stalled >= 2):
+                    break
         return {**data, 'aliases':aliases}
 
     async def recover_sent_mids(self, known, sent_text=None):

@@ -258,6 +258,23 @@ def index():
     return Response(GUI_HTML.read_bytes(), mimetype='text/html')
 
 
+@app.get('/favicon.ico')
+def favicon():
+    icon_path = RESOURCE_DIR / 'static' / 'icon.svg'
+    if icon_path.is_file():
+        return Response(icon_path.read_bytes(), mimetype='image/svg+xml')
+    return Response(status=204)
+
+
+_STATUS_ACTION_KEYS = ('method', 'confirm', 'sent', 'clicked', 'buttons_complete',
+                       'sent_mids', 'confirmed_by_reply', 'error', 'warning')
+
+
+def _slim_actions(actions):
+    return [{k: a[k] for k in _STATUS_ACTION_KEYS if k in a}
+            for a in (actions or []) if isinstance(a, dict)]
+
+
 @app.get('/api/status')
 def api_status():
     from web_engine import WebEngine
@@ -281,7 +298,7 @@ def api_status():
             candidates=[item for item in latest.get('evidence',[]) if item.get('source')=='unrelated'
                         and any(word in item.get('t','') for word in ('签到','打卡','积分'))
                         and judge_replies({},cfg,[item.get('t','')])!='unconfirmed']
-            groups.append({**latest, 'chat': chat,
+            groups.append({**latest, 'actions': _slim_actions(latest.get('actions')), 'chat': chat,
                            'candidate_replies': candidates, 'feedback_hint': feedback_hint(group, cfg, latest),
                            'name': group.get('title') or state.get('_titles', {}).get(chat) or chat,
                            'method': infer_method(actions[0]), 'methods': [infer_method(action) for action in actions], 'action_count': len(actions),

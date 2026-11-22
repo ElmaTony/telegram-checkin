@@ -226,6 +226,44 @@ class AuditFixGuiTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
         self.assertEqual(notifications.get_key(), KEY)
 
+    def test_favicon_and_slim_status_actions_payload(self):
+        import core.timeutil as timeutil
+        cfg = {'accounts': [{'name': 'A', 'groups': [{'chat': '-101', 'message': '签到'}]}]}
+        config.save_config(cfg)
+        today = f'{timeutil.now(cfg):%Y-%m-%d}'
+        state.save_state({
+            '_last': {
+                'A': {
+                    '-101': {
+                        'date': today,
+                        'confirm': 'unconfirmed',
+                        'sent': True,
+                        'actions': [{
+                            'method': 'text',
+                            'sent': True,
+                            'confirm': 'unconfirmed',
+                            'sent_mids': ['1001'],
+                            'confirmed_by_reply': True,
+                            'boundary': {'peer': '-101', 'cutoff': 1700000000, 'seen': [str(i) for i in range(50)]},
+                            'replies': ['duplicate reply'],
+                            'evidence': [{'mid': '1002', 't': 'duplicate evidence'}],
+                        }],
+                    }
+                }
+            }
+        })
+        fav = self.client.get('/favicon.ico')
+        self.assertIn(fav.status_code, (200, 204))
+        status = self.client.get('/api/status').json
+        group = status['accounts'][0]['groups'][0]
+        self.assertTrue(group['can_recheck'])
+        action = group['actions'][0]
+        self.assertNotIn('boundary', action)
+        self.assertNotIn('replies', action)
+        self.assertNotIn('evidence', action)
+        self.assertTrue(action['confirmed_by_reply'])
+        self.assertEqual(action['sent_mids'], ['1001'])
+
 
 if __name__ == '__main__':
     unittest.main()

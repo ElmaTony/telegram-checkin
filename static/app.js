@@ -605,4 +605,16 @@ if(state.page==='history')loadHistory().catch(e=>notify(e.message,true));
 if(state.page==='stats')loadStats().catch(e=>notify(e.message,true));
 if(state.page==='logs')loadLogs().catch(e=>notify(e.message,true));
 if(state.page==='automation')loadAutomation().then(render).catch(e=>notify(e.message,true));
-async function poll(){await refreshStatus();setTimeout(poll,state.status?.busy?1000:4000);}setTimeout(poll,2000);
+let pollTimer=null;
+function schedulePoll(delay=state.status?.busy?1000:4000){
+ clearTimeout(pollTimer);
+ if(document.hidden)return;
+ pollTimer=setTimeout(poll,delay);
+}
+async function poll(){
+ if(document.hidden)return;
+ await refreshStatus();
+ schedulePoll();
+}
+document.addEventListener('visibilitychange',()=>{if(document.hidden)clearTimeout(pollTimer);else poll();});
+schedulePoll(2000);

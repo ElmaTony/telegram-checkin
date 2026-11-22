@@ -39,7 +39,7 @@ export function methodLabel(group){
  const names={text:'文字',command:'口令',command_button:'口令＋按钮',button_only:'仅按钮',image_text:'图文',image_only:'图片'};
  return isMultiStep(group)?`${actionMethods(group).map(method=>names[method]).join(' / ')} · ${group.action_count||group.methods?.length||group.actions?.length} 步`:methods[group.method]||'文字签到';
 }
-export const sendUncertain = row => (row.actions||[]).some(action=>action.sent&&(action.warning&&!action.sent_mids?.length||action.sent_mids?.length&&action.sent_mids.every(mid=>String(mid).includes('.'))));
+export const sendUncertain = row => (row.actions||[]).some(action=>action.sent&&!action.confirmed_by_reply&&(action.warning&&!action.sent_mids?.length||action.sent_mids?.length&&action.sent_mids.every(mid=>String(mid).includes('.'))));
 export const sendLabel = row => row.confirm&&!(row.confirm==='failed'&&row.sent===false)?'单群重签':'单群签到';
 export function resultHint(row){
  if(row.draft_warning)return '原草稿恢复需要处理';

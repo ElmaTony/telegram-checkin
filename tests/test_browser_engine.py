@@ -962,5 +962,74 @@ class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(list(self.engine.profile.glob('checkin-drafts/*.json')))
         self.assertIn('恢复需核对',self.engine.last_draft_warning)
 
+    async def test_private_chat_temp_mid_confirmed_immediately_when_bot_deletes_and_replies(self):
+        self.engine._expected_peer = '701'
+        self.engine._mids_chat = '701'
+        await self.page.set_content('''
+          <div class="chat-info"><span class="peer-title" data-peer-id="701">Bot</span></div>
+          <div class="bubbles"><div class="bubbles-scrollable"><div class="bubbles-inner">
+            <div class="bubble is-in" data-mid="100" data-peer-id="701" data-timestamp="1700000000"><span class="message">old</span></div>
+          </div></div></div>
+          <div contenteditable="true" class="input-message-input" data-peer-id="701"></div>
+          <script>
+            document.querySelector('[contenteditable]').addEventListener('keydown', e => {
+              if (e.key !== 'Enter') return;
+              e.preventDefault();
+              e.target.textContent = '';
+              const inner = document.querySelector('.bubbles-inner');
+              const now = Math.floor(Date.now() / 1000);
+              const out = document.createElement('div');
+              out.className = 'bubble is-out is-sending';
+              out.dataset.mid = '100.0001'; out.dataset.peerId = '701'; out.dataset.timestamp = String(now);
+              out.innerHTML = '<span class="message">/checkin</span>';
+              inner.append(out);
+              setTimeout(() => {
+                out.remove();
+                const rep = document.createElement('div');
+                rep.className = 'bubble is-in';
+                rep.dataset.mid = '200'; rep.dataset.peerId = '701'; rep.dataset.timestamp = String(now + 1);
+                rep.innerHTML = '<span class="message">请选择按钮</span>';
+                inner.append(rep);
+              }, 120);
+            });
+          </script>
+        ''')
+        await self.engine.snapshot_incoming()
+        started = time.monotonic()
+        await self.engine.send_text('/checkin')
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 3.0)
+        self.assertTrue(self.engine._last_send_confirmed_by_reply)
+        self.assertIn('100.0001', self.engine.last_sent_mids)
+
+    async def test_button_only_reports_older_matching_message_clearly(self):
+        self.engine._expected_peer = '701'
+        self.engine._mids_chat = '701'
+        yesterday = int(time.time()) - 86400
+        await self.page.set_content(f'''
+          <div class="chat-info"><span class="peer-title" data-peer-id="701">Bot</span></div>
+          <div class="bubbles"><div class="bubbles-scrollable"><div class="bubbles-inner">
+            <div class="bubble is-in" data-mid="50" data-peer-id="701" data-timestamp="{yesterday}">
+              <span class="message">昨日推送</span>
+              <div class="reply-markup"><button class="reply-markup-button"><span class="reply-markup-button-text">一键签到</span></button></div>
+            </div>
+          </div></div></div>
+        ''')
+        with self.assertRaisesRegex(RuntimeError, '今天尚未收到包含按钮「一键签到」的新消息.*最近匹配消息时间'):
+            await self.engine.click_existing_button('一键签到', None, time.time() - 60)
+
+    async def test_collect_feedback_history_exits_quickly_on_empty_nonscrollable_chat(self):
+        self.engine._expected_peer = '-101'
+        self.engine._mids_chat = '-101'
+        await self.page.set_content('''
+          <div class="chat-info"><span class="peer-title" data-peer-id="-101">Topic</span></div>
+          <div class="bubbles"><div class="bubbles-scrollable" style="height:200px;overflow:auto"><div class="bubbles-inner no-messages"></div></div></div>
+        ''')
+        started = time.monotonic()
+        res = await self.engine.collect_feedback_history({'peer': '-101', 'cutoff': time.time() - 100, 'seen': []}, seconds=6)
+        elapsed = time.monotonic() - started
+        self.assertEqual(res['items'], [])
+        self.assertLess(elapsed, 2.5)
+
 
 if __name__=='__main__': unittest.main()

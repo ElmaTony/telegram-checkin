@@ -233,6 +233,8 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi, today=
                 action['sent_text'] = pick(configured.get('message', '签到'))
                 await engine.send_text(action['sent_text'])
             action['sent'] = True
+            if getattr(engine, '_last_send_confirmed_by_reply', False):
+                action['confirmed_by_reply'] = True
             engine._next_send_at = (getattr(engine, 'send_started_monotonic', None) or time.monotonic()) + random.uniform(lo, hi)
             group_sent_at = group_sent_at or getattr(engine, 'send_started_at', None)
             action['sent_mids'] = sorted(engine.last_sent_mids - before)
