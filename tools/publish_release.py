@@ -158,8 +158,8 @@ def main():
         remove_verified(verified)
         return
     version=(ROOT/'VERSION').read_text(encoding='utf-8').strip();tag='v'+version
-    repo_name=repository.split('/')[-1]
-    release_title=f'{repo_name} {tag}'
+    repo_title=' '.join(part.capitalize() for part in re.split(r'[-_]+',repository.split('/')[-1]) if part)
+    release_title=f'{repo_title} {tag}'
     notes=(ROOT/'docs'/'releases'/f'{tag}.md').read_text(encoding='utf-8')
     if not notes.startswith(f'# {release_title}'):
         raise RuntimeError(f'发行说明标题必须以 "# {release_title}" 开头')

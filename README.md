@@ -1,4 +1,4 @@
-# telegram-checkin
+# Telegram Checkin
 
 面向个人多账号的 **Telegram Web 自动化签到工作台**。基于真实浏览器会话运行，**无需申请 API ID / API Hash**，提供本地 Web 控制台、每日定时调度、只读证据补查、草稿无损恢复与 Server酱 微信汇总推送，支持桌面端与 Linux 服务器常驻运行。
 
