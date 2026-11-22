@@ -6,11 +6,11 @@ from pathlib import Path
 from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
 
 ROOT = Path(__file__).resolve().parents[1]
-FILES = ('VERSION', 'CHANGELOG.md', 'README.md', 'LICENSE', '.gitignore',
+FILES = ('VERSION', 'CHANGELOG.md', 'README.md', 'README_EN.md', 'LICENSE', '.gitignore',
          'app.py', 'telegram-checkin.spec', 'checkin.py', 'gui.py', 'gui.html', 'web_engine.py', 'requirements.txt', 'requirements-build.txt',
          'requirements.lock.txt', 'config.example.yaml', 'start_gui.bat', 'start_checkin.bat',
          'docs/CLOUD.md', 'docs/CONFIGURATION.md',
-         'docs/assets/workbench.png', 'docs/assets/automation.png', 'docs/assets/topic-picker.png', 'docs/assets/manifest.json')
+         'docs/assets/icon.svg', 'docs/assets/workbench.png', 'docs/assets/automation.png', 'docs/assets/topic-picker.png', 'docs/assets/manifest.json')
 DIRECTORIES = ('core', 'static', 'tests', 'tools', 'deploy', '.github')
 SUFFIXES = {'.py', '.js', '.css', '.html', '.txt', '.md', '.yml', '.yaml', '.service', '.example', '.sh'}
 SECRETS = re.compile(rb'\b(?:SCT[A-Za-z0-9]{16,}|sctp\d+t[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b')
