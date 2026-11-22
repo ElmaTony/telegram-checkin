@@ -5,7 +5,6 @@
 A multi-account **Telegram Web check-in workbench** with a local web UI, daily scheduler, read-only feedback verification, draft preservation, and WeChat (ServerChan) notifications — no API ID / API Hash required.
 
 [![Build](https://github.com/ElmaTony/telegram-checkin/actions/workflows/build.yml/badge.svg)](https://github.com/ElmaTony/telegram-checkin/actions/workflows/build.yml)
-[![Releases](https://img.shields.io/badge/Releases-Latest-1474c4)](https://github.com/ElmaTony/telegram-checkin/releases/latest)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-4a607a)](https://github.com/ElmaTony/telegram-checkin/releases/latest)
 [![License](https://img.shields.io/badge/License-MIT-137347)](LICENSE)
@@ -16,13 +15,15 @@ A multi-account **Telegram Web check-in workbench** with a local web UI, daily s
 
 ## 界面预览 / Screenshots
 
-| 签到工作台 · Workbench | 定时计划与微信通知 · Schedule & Notifications |
-| --- | --- |
-| ![签到工作台](docs/assets/workbench.png) | ![定时计划与微信通知](docs/assets/automation.png) |
+![签到工作台](docs/assets/workbench.png)
 
 <details>
-<summary>论坛话题选择预览 · Forum Topic Picker Preview</summary>
+<summary>更多界面预览：定时计划与微信通知 / 论坛话题选择 · More Screenshots: Schedule & Forum Topic Picker</summary>
 
+### 定时计划与微信通知 · Schedule & Notifications
+![定时计划与微信通知](docs/assets/automation.png)
+
+### 论坛话题选择 · Forum Topic Picker
 ![论坛话题选择](docs/assets/topic-picker.png)
 
 </details>
@@ -39,7 +40,7 @@ A multi-account **Telegram Web check-in workbench** with a local web UI, daily s
 - **六种签到方式与多步串联**：支持文字、口令、仅按钮、口令＋按钮、图片＋文字、仅图片及多步动作组合，支持随机文案与 `{n}` / `X` 数字通配判定词，支持**共用系统主群优先与结果代签**。
 - **证据驱动与防盲目重发**：联合监测机器人回复、模态弹窗、非模态 Toast 与原按钮消息编辑，严格区分「成功 / 待确认 / 失败」；当天已发或状态不明的目标优先只读补查，不盲目重发。
 - **云端草稿无损保护**：进入会话后先备份并清空已有草稿，无论成功、失败或中途取消均恢复至原账号、原群与原话题；无法可靠恢复时保留本地备份并显著提示。
-- **定时调度与微信通知**：内置独立于服务器系统时区的每日计划（支持全量 IANA 时区检索、账号范围筛选、后台浏览器与错过补跑），整轮结束后通过 **Server酱** 汇总推送微信结果。
+- **定时调度与微信通知**：内置独立于服务器系统时区的每日计划（支持自定义时间选择器、全量 IANA 时区检索、账号范围筛选、后台浏览器与错过补跑），整轮结束后通过 **Server酱** 汇总推送微信结果。
 - **双色现代工作台**：内置 Telegram Sky 浅色与夜色主题，提供发送预览、实时执行进度、按日历史归档、统计面板与运行日志排查。
 
 ### 下载安装
@@ -51,7 +52,7 @@ A multi-account **Telegram Web check-in workbench** with a local web UI, daily s
 | 操作系统与架构 | 下载文件 |
 | --- | --- |
 | Windows x64 | `telegram-checkin-v*-windows-x64.zip` |
-| macOS Apple 芯片（M1–M4） | `telegram-checkin-v*-macos-arm64.tar.gz` |
+| macOS Apple 芯片 | `telegram-checkin-v*-macos-arm64.tar.gz` |
 | macOS Intel | `telegram-checkin-v*-macos-x64.tar.gz` |
 | Linux x64 | `telegram-checkin-v*-linux-x64.tar.gz` |
 | Linux ARM64 | `telegram-checkin-v*-linux-arm64.tar.gz` |
@@ -149,7 +150,7 @@ Linux 源码部署安装浏览器系统库可使用 `playwright install --with-d
 
 ### 相关文档
 
-- **[配置参考（docs/CONFIGURATION.md）](docs/CONFIGURATION.md)** · **[云端部署（docs/CLOUD.md）](docs/CLOUD.md)** · **[更新记录（CHANGELOG.md）](CHANGELOG.md)** · **[MIT License](LICENSE)**
+**[配置参考（docs/CONFIGURATION.md）](docs/CONFIGURATION.md)** · **[云端部署（docs/CLOUD.md）](docs/CLOUD.md)** · **[更新记录（CHANGELOG.md）](CHANGELOG.md)** · **[MIT License](LICENSE)**
 
 ---
 
@@ -163,7 +164,7 @@ Linux 源码部署安装浏览器系统库可使用 `playwright install --with-d
 - **Six Check-in Methods & Multi-Step Workflows**: Supports text, command, button-only, command + multi-level buttons, image + text, image-only, chained actions, randomized messages, `{n}` / `X` numeric wildcards, and **shared check-in groups** (primary-first execution with automatic propagation).
 - **Evidence-Based Verification & Anti-Resend**: Monitors bot replies, modal popups, non-modal toasts, and inline button message edits to distinguish **Success**, **Unconfirmed**, and **Failed**. Already-sent or uncertain targets use read-only recheck first instead of blind resending.
 - **Lossless Draft Preservation**: Backs up and clears existing Telegram drafts before sending, then restores them to the exact account, chat, and topic on completion, failure, or cancellation; preserves a local backup with a clear warning if safe restoration is not possible.
-- **Daily Scheduler & WeChat Summary**: Runs an independent daily schedule in any IANA timezone (with searchable timezone picker, account scoping, headless execution, and same-day catch-up), sending a consolidated summary via **ServerChan** when each round finishes.
+- **Daily Scheduler & WeChat Summary**: Runs an independent daily schedule in any IANA timezone (with custom time picker, searchable timezone picker, account scoping, headless execution, and same-day catch-up), sending a consolidated summary via **ServerChan** when each round finishes.
 - **Modern Light & Night Workbench**: Built-in Telegram Sky light/dark theme with run preview, live progress, grouped execution history, statistics, and runtime log viewer.
 
 ### Installation
@@ -175,7 +176,7 @@ Download the archive for your platform from **[Latest Release](https://github.co
 | Platform & Architecture | Package |
 | --- | --- |
 | Windows x64 | `telegram-checkin-v*-windows-x64.zip` |
-| macOS Apple Silicon (M1–M4) | `telegram-checkin-v*-macos-arm64.tar.gz` |
+| macOS Apple Silicon | `telegram-checkin-v*-macos-arm64.tar.gz` |
 | macOS Intel | `telegram-checkin-v*-macos-x64.tar.gz` |
 | Linux x64 | `telegram-checkin-v*-linux-x64.tar.gz` |
 | Linux ARM64 | `telegram-checkin-v*-linux-arm64.tar.gz` |
@@ -197,7 +198,7 @@ Install Chromium once, then launch the workbench:
 Open **[http://127.0.0.1:8577](http://127.0.0.1:8577)** in your browser.
 
 > [!NOTE]
-> Network access to Telegram Web is required. On Linux, run `sudo ./telegram-checkin --install-browser-deps` if browser system libraries are missing. macOS packages are currently unsigned/unnotarized.
+> Network access to Telegram Web is required. On Linux, run `sudo ./telegram-checkin --install-browser-deps` if browser system libraries are missing. macOS packages are currently unsigned and unnotarized.
 
 #### Option 2: Run from Source (Python 3.11+)
 
@@ -222,6 +223,8 @@ python3 -m venv .venv
 .venv/bin/python app.py
 ```
 
+On Linux, use `playwright install --with-deps chromium` to install system browser libraries. On Windows, you can double-click `start_gui.bat` for daily launches.
+
 #### Common CLI Flags
 
 | Flag | Description |
@@ -236,10 +239,10 @@ python3 -m venv .venv
 
 ### Quick Start
 
-1. **Add & Sign In**: Open **Accounts & Rules**, add an account, save, then click **Login** and scan the Telegram Web QR code.
+1. **Add & Sign In**: Open **Accounts & Rules (`账号与规则`)**, add an account, save, then click **Login (`登录`)** and scan the Telegram Web QR code.
 2. **Configure Chats**: Pick target groups, channels, or bots from your Telegram chat list, configure check-in methods/keywords, and pick the target topic for forum groups.
-3. **Run & Inspect**: Trigger all accounts, a single account, or a single chat from the **Workbench**; enable browser visibility if you want to watch the run live.
-4. **Schedule & Notify**: Configure daily run time, IANA timezone, account scope, and your ServerChan `SendKey` under **Schedule & Notifications**, then test delivery.
+3. **Run & Inspect**: Trigger all accounts, a single account, or a single chat from **Workbench (`签到工作台`)**; enable browser visibility if you want to watch the run live.
+4. **Schedule & Notify**: Configure daily run time, IANA timezone, account scope, and your ServerChan `SendKey` under **Schedule & Notifications (`定时与通知`)**, then send a test notification.
 
 > The daily schedule is disabled by default; keep either the Web UI or `--schedule` running once enabled.
 
@@ -251,7 +254,10 @@ python3 -m venv .venv
 | **Unconfirmed** | A send occurred, but evidence is insufficient; use **Read-Only Recheck** before resending. |
 | **Failed** | Navigation, topic lookup, sending, or button interaction failed; inspect the details first. |
 
-Standalone packages store persistent data separately from program binaries (override with `--home` or `CHECKIN_HOME`):
+- **Lossless Draft Recovery**: Existing drafts are backed up and cleared before sending, and restored afterward on success, failure, or cancellation; if safe restoration cannot be verified, the local backup is preserved with an explicit alert.
+- **Anti-Resend Protection**: Already-sent or uncertain chats are never blindly re-sent by the scheduler, and an interrupted scheduled run will not fire a second time on the same day.
+
+Source installs store data in the repository directory, while standalone packages store persistent data separately (override with `--home` or `CHECKIN_HOME`):
 
 | OS | Default Data Directory |
 | --- | --- |
@@ -268,4 +274,4 @@ Supports long-running headless deployment on Ubuntu 22.04 / 24.04 (x64 & ARM64) 
 
 ### Documentation
 
-- **[Configuration Reference (docs/CONFIGURATION.md)](docs/CONFIGURATION.md)** · **[Cloud Deployment (docs/CLOUD.md)](docs/CLOUD.md)** · **[Changelog (CHANGELOG.md)](CHANGELOG.md)** · **[MIT License](LICENSE)**
+**[Configuration Reference](docs/CONFIGURATION.md)** (Chinese) · **[Cloud Deployment](docs/CLOUD.md)** (Chinese) · **[Changelog](CHANGELOG.md)** (Chinese) · **[MIT License](LICENSE)**
