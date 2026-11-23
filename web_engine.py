@@ -259,6 +259,14 @@ class WebEngine:
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
             if await self._looks_logged_in_now():
+                if hasattr(self.page, 'wait_for_function'):
+                    try:
+                        await self.page.wait_for_function(
+                            "() => !!document.querySelector('.chatlist-chat[data-peer-id], .bubbles .bubble[data-mid]')",
+                            timeout=3000,
+                        )
+                    except Exception:
+                        pass
                 return True
             await asyncio.sleep(.25)
         self.marker().unlink(missing_ok=True)
@@ -563,27 +571,41 @@ class WebEngine:
         await self._close_topic_panel()
         ref = str(want_num)
         bare = str(name).replace('【', '').replace('】', '').strip()
-        queries = list(dict.fromkeys([bare, bare[-6:]]))
+        primary = bare
+        for sep in ('|', '｜', ' - ', '：', ':', '（', '('):
+            if sep in primary:
+                head = primary.split(sep, 1)[0].strip()
+                if len(head) >= 2:
+                    primary = head
+                    break
+        queries = [q for q in dict.fromkeys([primary, bare, bare[-6:]]) if q]
+        find_js = r"""ref => {
+            const hash = '#' + ref;
+            for (const el of document.querySelectorAll('.search-super .row, .search-super a, .chatlist-chat')) {
+                if (!el.checkVisibility()) continue;
+                if (el.getAttribute('data-peer-id') === ref || el.getAttribute('href') === hash) return el;
+            }
+            return null;
+        }"""
         for query in queries:
             try:
                 box = await self._first(SEL_SEARCH, timeout=1500)
                 await box.click(timeout=1500)
-                await box.fill('',timeout=1500)
-                await box.type(query, delay=30,timeout=2000)
-                await box.press('Enter',timeout=1500)
-                deadline = time.monotonic() + 4
+                await box.fill('', timeout=1500)
+                await box.type(query, delay=30, timeout=2000)
+                await box.press('Enter', timeout=1500)
+                deadline = time.monotonic() + 3.5
                 while time.monotonic() < deadline:
-                    candidates = self.page.locator('.search-super .row, .search-super a, .chatlist-chat')
-                    for index in range(await candidates.count()):
-                        row = candidates.nth(index)
-                        if not await row.is_visible():
-                            continue
-                        if await row.get_attribute('data-peer-id') != ref and await row.get_attribute('href') != '#' + ref:
-                            continue
-                        await row.click(timeout=1500)
-                        if await self._wait_opened(ref, timeout=2):
-                            return True
-                    await asyncio.sleep(.2)
+                    handle = await self.page.evaluate_handle(find_js, ref)
+                    try:
+                        row = handle.as_element()
+                        if row is not None:
+                            await row.click(timeout=1500)
+                            if await self._wait_opened(ref, timeout=2):
+                                return True
+                    finally:
+                        await handle.dispose()
+                    await asyncio.sleep(.15)
             except Exception as error:
                 log.debug('搜索定位 %s 失败：%s', ref, error)
         return False
@@ -1709,22 +1731,29 @@ class WebEngine:
                 if not exact and not edited_button and record.get("ts", 0) < int(known["cutoff"]) - 5:
                     continue
                 private = str(known["peer"]).isdigit()
-                relation = 'button_edit' if edited_button else ('reply:' + str(record.get('rm')) if exact else 'private' if private else 'unrelated')
+                mentioned_self = False
+                if not exact and not private and not edited_button and len(record.get("mentions") or []) == 1:
+                    own = self._self_peer
+                    if own is None:
+                        own = await self.current_user_peer()
+                        await self.assert_destination()
+                    mentioned_self = bool(own and record["mentions"] == [own])
+                relation = 'button_edit' if edited_button else ('reply:' + str(record.get('rm')) if exact else 'mention:' + str(record['mentions'][0]) if mentioned_self else 'private' if private else 'unrelated')
                 if not edited_button and mid in seen and (mid not in known['versions'] or known['versions'][mid] == record['t'] and relations.get(mid, 'unrelated') == relation):
                     continue
                 if edited_button and known['versions'].get(mid) == record['t'] and relations.get(mid) == 'button_edit':
                     continue
-                if not exact and not private and not edited_button and mode == "reply_only":
+                if not exact and not mentioned_self and not private and not edited_button and mode == "reply_only":
                     continue
                 seen.add(mid)
                 known["seen"] = sorted(seen)
                 known["versions"][mid] = record["t"]
                 relations[mid] = relation
                 found.append(record["t"])
-                source = "button_popup" if edited_button else ("reply_to_sent" if exact else "private_chat" if private else "unrelated")
+                source = "button_popup" if edited_button else ("reply_to_sent" if exact else "mention_self" if mentioned_self else "private_chat" if private else "unrelated")
                 record = {**record, "source": source}
                 evidence.append(record)
-                if exact or private or edited_button:
+                if exact or mentioned_self or private or edited_button:
                     replied.append(record["t"])
                     last_related = time.monotonic()
             if last_related is not None and time.monotonic() - last_related >= idle_after and (is_complete is None or is_complete(replied)):

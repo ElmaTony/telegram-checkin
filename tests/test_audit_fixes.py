@@ -9,7 +9,7 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 import checkin
@@ -263,6 +263,51 @@ class AuditFixGuiTests(unittest.TestCase):
         self.assertNotIn('evidence', action)
         self.assertTrue(action['confirmed_by_reply'])
         self.assertEqual(action['sent_mids'], ['1001'])
+
+    def test_send_group_actions_retries_once_on_open_timeout_before_sending(self):
+        from contextlib import asynccontextmanager
+        import core.runner as runner
+
+        class FlakyOpenEngine:
+            def __init__(self):
+                self.opens = 0
+                self.sends = 0
+                self.last_draft_warning = None
+                self.last_sent_mids = set()
+                self.last_replied = ['签到成功']
+                self.last_evidence = [{'mid': '2', 't': '签到成功', 'source': 'private_chat'}]
+                self.last_allowed_mids = ['1']
+                self._expected_peer = '701'
+                self._last_actual_peer = '701'
+                self.send_started_at = 1.0
+                self.send_started_monotonic = 1.0
+                self.before_send = None
+                self._next_send_at = 0
+
+            async def open_chat(self, *args, **kwargs):
+                self.opens += 1
+                if self.opens == 1:
+                    raise RuntimeError('打开 Target 超过 45 秒；未发送，请检查会话是否仍可访问')
+
+            async def assert_destination(self): pass
+            async def opened_chat_info(self): return {'pid': '701', 'title': 'Target'}
+            @asynccontextmanager
+            async def preserve_draft(self): yield
+            async def snapshot_incoming(self, mode='after'): return {'peer': '701', 'cutoff': 1.0, 'seen': []}
+            async def send_text(self, text):
+                self.sends += 1
+                self.last_sent_mids.add('1')
+            async def watch_new_incoming(self, *args, **kwargs): return ['签到成功']
+
+        eng = FlakyOpenEngine()
+        cfg = {'reply_wait_seconds': 1}
+        group = {'chat': '701', 'title': 'Target', 'method': 'text', 'message': '签到'}
+        with patch.object(runner.asyncio, 'sleep', AsyncMock()):
+            title, actions, err, mode = asyncio.run(runner._send_group_actions(eng, {}, 'A', group, cfg, 0, 0, today='2026-11-23'))
+        self.assertEqual(eng.opens, 2)
+        self.assertEqual(eng.sends, 1)
+        self.assertIsNone(err)
+        self.assertEqual(actions[0]['confirm'], 'success')
 
 
 if __name__ == '__main__':

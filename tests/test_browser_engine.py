@@ -1031,5 +1031,45 @@ class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res['items'], [])
         self.assertLess(elapsed, 2.5)
 
+    async def test_open_by_search_uses_primary_segment_before_separator(self):
+        await self.page.evaluate('''()=>{
+            document.querySelector('.peer-title').dataset.peerId='-999';document.querySelector('[contenteditable]').dataset.peerId='-999';
+            const d=document.createElement('div');d.innerHTML='<input class="input-search-input"><div class="search-super"></div>';
+            const box=d.querySelector('input');const res=d.querySelector('.search-super');
+            box.addEventListener('input',()=>{
+                res.innerHTML=box.value==='AlphaBot'?'<div class="row" data-peer-id="701">AlphaBot | Long Subtitle</div>':'';
+                const row=res.querySelector('.row');
+                if(row)row.onclick=()=>{document.querySelector('.peer-title').dataset.peerId='701';document.querySelector('[contenteditable]').dataset.peerId='701'};
+            });
+            document.body.append(d);
+        }''')
+        self.assertTrue(await self.engine._open_by_search('AlphaBot | Long Subtitle', 701))
+
+    async def test_watch_new_incoming_accepts_exclusive_self_mention_and_ignores_other_mention(self):
+        self.engine._expected_peer = '-101'
+        self.engine._mids_chat = '-101'
+        self.engine._self_peer = '555001'
+        now = int(time.time())
+        await self.page.set_content(f'''
+          <div class="chat-info"><span class="peer-title" data-peer-id="-101">Group</span></div>
+          <div class="bubbles"><div class="bubbles-scrollable"><div class="bubbles-inner">
+            <div class="bubble is-in" data-mid="10" data-peer-id="-101" data-timestamp="{now - 60}"><span class="message">old</span></div>
+          </div></div></div>
+        ''')
+        known = await self.engine.snapshot_incoming()
+        await self.page.evaluate(f'''()=>{{
+            const inner=document.querySelector('.bubbles-inner');
+            const other=document.createElement('div');
+            other.className='bubble is-in'; other.dataset.mid='11'; other.dataset.peerId='-101'; other.dataset.timestamp='{now}';
+            other.innerHTML='<span class="message"><a data-follow="999999">Other</a> 签到失败</span>';
+            const mine=document.createElement('div');
+            mine.className='bubble is-in'; mine.dataset.mid='12'; mine.dataset.peerId='-101'; mine.dataset.timestamp='{now + 1}';
+            mine.innerHTML='<span class="message"><a data-follow="555001">Me</a> 签到成功 +5</span>';
+            inner.append(other, mine);
+        }}''')
+        await self.engine.watch_new_incoming(known, 0.5, mode='reply_only', idle_after=0.1, sent_mids=['9'])
+        self.assertEqual(self.engine.last_replied, ['Me 签到成功 +5'])
+        self.assertEqual([e['source'] for e in self.engine.last_evidence], ['mention_self'])
+
 
 if __name__=='__main__': unittest.main()

@@ -7,6 +7,7 @@ import logging
 import random
 import re
 import time
+from contextvars import ContextVar
 from datetime import datetime
 
 from . import BASE_DIR
@@ -23,6 +24,7 @@ ACTIVITY = {'act': '', 'accounts': {}}
 CAPTURE = {'items': [], 'window': 0}
 PROBE = {'running': False, 'progress': '', 'result': None, 'started': ''}
 _TITLE_JUNK = re.compile(r'[\uE000-\uF8FF\u200b-\u200f\uFEFF]')
+_LAUNCH_SEM = ContextVar('checkin_launch_sem', default=None)
 
 
 def clean_title(value):
@@ -128,7 +130,16 @@ async def _send_group_actions(engine, state, name, group, cfg, lo, hi, today=Non
     all_button_only = bool(configured_actions) and all((a.get('method') or infer_method(a)) == 'button_only' for a in configured_actions)
     _progress(name, '打开会话', group)
     open_kwargs = {'require_composer': False} if all_button_only and 'require_composer' in inspect.signature(engine.open_chat).parameters else {}
-    await engine.open_chat(str(group['chat']), group.get('title'), group.get('topic'), group.get('folder'), group.get('topic_id'), **open_kwargs)
+    for attempt in range(2):
+        try:
+            await engine.open_chat(str(group['chat']), group.get('title'), group.get('topic'), group.get('folder'), group.get('topic_id'), **open_kwargs)
+            break
+        except RuntimeError as error:
+            if attempt == 0 and '超过 45 秒' in str(error):
+                log.warning('[%s] %s 首次打开超时（未发送），重试一次', name, group.get('title') or group['chat'])
+                await asyncio.sleep(1.0)
+                continue
+            raise
     await engine.assert_destination()
     cancelled_holder = {}
     if all_button_only:
@@ -424,10 +435,17 @@ async def _web_account_worker(account, cfg, state, today, lo, hi, wait_seconds, 
         return {}
     engine = WebEngine(account, cfg)
     results, pending = {}, []
+    launch_sem = _LAUNCH_SEM.get()
     try:
-        _progress(name, '启动浏览器')
-        await engine.launch()
-        await engine.ensure_login()
+        if launch_sem is not None:
+            async with launch_sem:
+                _progress(name, '启动浏览器')
+                await engine.launch()
+                await engine.ensure_login()
+        else:
+            _progress(name, '启动浏览器')
+            await engine.launch()
+            await engine.ensure_login()
         if recheck:
             for group in selected:
                 previous = state.get('_last', {}).get(name, {}).get(str(group['chat']), {})
@@ -529,6 +547,7 @@ async def _web_account_worker(account, cfg, state, today, lo, hi, wait_seconds, 
 async def run_web_round(cfg, state, only=None, chats=None, chats_by_account=None, recheck=False, accounts=None):
     lock = FileLock(BASE_DIR / 'data' / 'locks' / 'round.lock').acquire()
     zone_token = set_timezone(cfg)
+    sem_token = None
     tasks = []
     try:
         state.clear()
@@ -540,6 +559,7 @@ async def run_web_round(cfg, state, only=None, chats=None, chats_by_account=None
         CAPTURE.update(items=[], window=wait)
         ACTIVITY.update(act='', accounts={})
         delay_lo, delay_hi = delay_range(cfg.get('account_delay_seconds'), (0, 0))
+        sem_token = _LAUNCH_SEM.set(asyncio.Semaphore(1))
         for account in cfg.get('accounts', []):
             if only and account['name'] != only:
                 continue
@@ -587,6 +607,8 @@ async def run_web_round(cfg, state, only=None, chats=None, chats_by_account=None
         finally:
             lock.release()
             reset_timezone(zone_token)
+            if sem_token is not None:
+                _LAUNCH_SEM.reset(sem_token)
 
 
 async def _probe_account(account, cfg, chats=None):
