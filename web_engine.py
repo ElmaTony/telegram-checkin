@@ -818,11 +818,13 @@ class WebEngine:
             await self.assert_destination()
             return
         await self.page.evaluate("h => { location.hash = h; }", target_ref)
-        if await ready(2):
+        if await ready(1.2):
             return
         if folder and not topic and await self._open_via_folder(target_ref, folder, topic) and await ready(2):
             return
-        item = await self._scroll_find(target_ref, time.monotonic() + 5)
+        if title and self._expected_peer and await self._open_by_search(str(title), int(self._expected_peer)) and await ready(3):
+            return
+        item = await self._scroll_find(target_ref, time.monotonic() + 3)
         if item is not None:
             try:
                 await self._close_topic_panel()
@@ -830,9 +832,7 @@ class WebEngine:
                 if await ready(3):
                     return
             except Exception as error:
-                log.debug('列表定位失败，改用搜索：%s', error)
-        if title and self._expected_peer and await self._open_by_search(str(title), int(self._expected_peer)) and await ready(3):
-            return
+                log.debug('列表定位失败，改用重载恢复：%s', error)
         await self.page.reload(wait_until="domcontentloaded", timeout=12000)
         if await ready(5):
             return
@@ -1283,6 +1283,7 @@ class WebEngine:
                         if button:
                             await self.assert_destination()
                             await button.click(timeout=max(100, int((deadline - time.monotonic()) * 1000)))
+                            self.send_started_monotonic = time.monotonic()
                             if meta.get("mid") and self._active_mids is not None:
                                 self._active_mids.add(meta["mid"])
                             return True
@@ -1485,7 +1486,7 @@ class WebEngine:
         let scrolled=false;
         const viewport=pane?.querySelector('.bubbles-scrollable');
         const initial_loading=!!viewport&&!bubble&&!empty&&viewport.scrollHeight<=viewport.clientHeight+10;
-        if(align&&!bubble&&viewport&&viewport.scrollTop>=0&&viewport.scrollTop+viewport.clientHeight<viewport.scrollHeight-20){
+        if(align&&(!bubble||(pending&&!button))&&viewport&&viewport.scrollTop>=0&&viewport.scrollTop+viewport.clientHeight<viewport.scrollHeight-20){
             const before=viewport.scrollTop;viewport.scrollTop=viewport.scrollHeight;scrolled=Math.abs(viewport.scrollTop-before)>1;
         }
         if(!owner&&!pending&&bubble){
@@ -1501,10 +1502,15 @@ class WebEngine:
     async def _scroll_chat_bottom(self):
         await self.assert_destination()
         deadline=time.monotonic()+18
-        attempts=0;last_click=0;settled=None
+        attempts=0;last_click=0;settled=None;stuck_since=None
         while time.monotonic()<deadline:
             current=time.monotonic()
-            state=await self.page.evaluate(self._LATEST_VIEW_JS,{'peer':str(self._expected_peer),'align':attempts>0})
+            align=attempts>0 or (stuck_since is not None and current-stuck_since>=.4)
+            state=await self.page.evaluate(self._LATEST_VIEW_JS,{'peer':str(self._expected_peer),'align':align})
+            if state['has_jump'] and not state['clickable'] and not state['initial_loading']:
+                stuck_since=stuck_since or current
+            else:
+                stuck_since=None
             if state['has_jump'] and state['clickable'] and not state['initial_loading'] and attempts<6 and current-last_click>=(.8 if state['ready'] else 2):
                 handle=await self.page.evaluate_handle(self._LATEST_VIEW_JS,{'peer':str(self._expected_peer),'element':True})
                 try:

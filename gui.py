@@ -39,6 +39,7 @@ HOST = '127.0.0.1'
 GUI_HTML = RESOURCE_DIR / 'gui.html'
 app = Flask(__name__, static_folder=str(RESOURCE_DIR/'static'))
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
+app.json.ensure_ascii = False
 log = logging.getLogger('checkin')
 BOT = {'loop': None, 'busy': False, 'scanning': False, 'cfg_error': None, 'task': None,
        'cancel_requested': False, 'login_process': None, 'job': None}

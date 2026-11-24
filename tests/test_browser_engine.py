@@ -1071,5 +1071,49 @@ class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.engine.last_replied, ['Me 签到成功 +5'])
         self.assertEqual([e['source'] for e in self.engine.last_evidence], ['mention_self'])
 
+    async def test_click_button_refreshes_send_started_monotonic_for_reply_wait(self):
+        self.engine._expected_peer = '701'
+        self.engine._mids_chat = '701'
+        self.engine.send_started_monotonic = 1.0
+        now = int(time.time())
+        await self.page.set_content(f'''
+          <div class="chat-info"><span class="peer-title" data-peer-id="701">Bot</span></div>
+          <div class="bubbles"><div class="bubbles-scrollable"><div class="bubbles-inner">
+            <div class="bubble is-in" data-mid="20" data-peer-id="701" data-timestamp="{now}">
+              <span class="message">请选择</span>
+              <div class="reply-markup"><button class="reply-markup-button"><span class="reply-markup-button-text">确认签到</span></button></div>
+            </div>
+          </div></div></div>
+        ''')
+        self.engine._capture_by_chat['701'] = {'peer': '701', 'cutoff': now - 5, 'seen': set()}
+        self.engine._active_mids = {'19'}
+        before = time.monotonic()
+        self.assertTrue(await self.engine.click_button('确认签到', timeout=2))
+        self.assertGreaterEqual(self.engine.send_started_monotonic, before)
+
+    async def test_scroll_chat_bottom_recovers_when_go_down_stuck_without_clickable_button(self):
+        self.engine._expected_peer = '-101'
+        await self.page.set_content('''
+          <div class="chat is-go-down-visible">
+            <div class="chat-info"><span class="peer-title" data-peer-id="-101">Busy</span></div>
+            <div class="bubbles"><div class="bubbles-scrollable" style="height:120px;overflow:auto">
+              <div class="bubbles-inner" style="height:900px;display:flex;flex-direction:column;justify-content:flex-end">
+                <div class="bubble is-in" data-mid="100" data-peer-id="-101"><span class="message">hi</span></div>
+              </div>
+            </div></div>
+          </div>
+          <script>
+            const sc = document.querySelector('.bubbles-scrollable');
+            sc.addEventListener('scroll', () => {
+              if (sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 20) {
+                document.querySelector('.chat').classList.remove('is-go-down-visible');
+              }
+            });
+          </script>
+        ''')
+        started = time.monotonic()
+        await self.engine._scroll_chat_bottom()
+        self.assertLess(time.monotonic() - started, 2.0)
+
 
 if __name__=='__main__': unittest.main()

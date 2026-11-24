@@ -174,6 +174,7 @@ async def _watch_feedback(engine, boundary, group, cfg, *, sent_mids, started_at
     return await engine.watch_new_incoming(
         boundary, float(cfg.get('reply_wait_seconds', 6)),
         group.get('reply_mode') or cfg.get('reply_mode') or 'reply_only',
+        idle_after=0.8,
         sent_mids=sent_mids, started_at=started_at,
         is_complete=lambda trusted: judge_replies(group, cfg, trusted, trusted) != 'unconfirmed',
         **extra)

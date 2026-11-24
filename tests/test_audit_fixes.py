@@ -254,7 +254,9 @@ class AuditFixGuiTests(unittest.TestCase):
         })
         fav = self.client.get('/favicon.ico')
         self.assertIn(fav.status_code, (200, 204))
-        status = self.client.get('/api/status').json
+        resp = self.client.get('/api/status')
+        self.assertNotIn(b'\\u', resp.data)
+        status = resp.json
         group = status['accounts'][0]['groups'][0]
         self.assertTrue(group['can_recheck'])
         action = group['actions'][0]
