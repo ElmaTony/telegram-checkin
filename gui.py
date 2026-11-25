@@ -268,7 +268,7 @@ def favicon():
 
 
 _STATUS_ACTION_KEYS = ('method', 'confirm', 'sent', 'clicked', 'buttons_complete',
-                       'sent_mids', 'confirmed_by_reply', 'error', 'warning')
+                       'button_mid', 'sent_mids', 'confirmed_by_reply', 'error', 'warning')
 
 
 def _slim_actions(actions):

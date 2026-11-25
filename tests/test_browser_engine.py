@@ -1115,5 +1115,124 @@ class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
         await self.engine._scroll_chat_bottom()
         self.assertLess(time.monotonic() - started, 2.0)
 
+    async def test_button_only_clicks_unclicked_older_reminder_and_captures_transient_toast(self):
+        self.engine._expected_peer = self.engine._mids_chat = '701'
+        three_days_ago = int(time.time()) - 3 * 86400
+        await self.page.set_content(f'''
+          <div class="chat active">
+            <div class="chat-info"><span class="peer-title" data-peer-id="701">Bot</span></div>
+            <div class="bubbles"><div class="bubbles-inner">
+              <div class="bubble is-in" data-peer-id="701" data-mid="50" data-timestamp="{three_days_ago}">
+                <div class="message"><div data-message-text-source="">发现您今日未签到，请问是否需要签到呢。</div><span class="time">00:56</span></div>
+                <div class="reply-markup">
+                  <button class="reply-markup-button" id="act"><span class="reply-markup-button-text">\ue918 ✅ 点我一键签到</span></button>
+                  <button class="reply-markup-button" id="mute">关闭提醒</button>
+                </div>
+              </div>
+            </div></div>
+          </div>
+          <div class="toast" id="stale-toast" style="height:24px">旧通知</div>
+          <script>
+            document.querySelector('#act').onclick = () => {{
+              document.querySelector('.reply-markup').remove();
+              const t = document.createElement('div');
+              t.className = 'toast';
+              t.style.height = '28px';
+              t.textContent = '\ue901 签到成功！积分 +10';
+              document.body.append(t);
+              setTimeout(() => t.remove(), 25);
+            }};
+          </script>
+        ''')
+        boundary = await self.engine.snapshot_incoming()
+        mid = await self.engine.click_existing_button('点我一键签到', None, 0)
+        self.assertEqual(mid, '50')
+        await asyncio.sleep(0.06)  # Simulate checkpoint disk write after transient toast already vanished
+        found = await self.engine.watch_new_incoming(
+            boundary, 1.0, 'reply_only', idle_after=0.05,
+            watch_button_mid=mid,
+            button_initial_text=self.engine._last_button_initial_text,
+            button_initial_buttons=self.engine._last_button_initial_buttons,
+            check_popup=True,
+        )
+        self.assertEqual(found, ['签到成功！积分 +10'])
+        self.assertEqual(self.engine.last_replied, ['签到成功！积分 +10'])
+        self.assertEqual(self.engine.last_evidence[0]['source'], 'button_popup')
+
+    async def test_popup_with_link_is_dismissed_and_button_label_edit_is_captured(self):
+        self.engine._expected_peer = self.engine._mids_chat = '701'
+        now = int(time.time())
+        await self.page.set_content(f'''
+          <div class="chat active">
+            <div class="chat-info"><span class="peer-title" data-peer-id="701">Bot</span></div>
+            <div contenteditable="true" class="input-message-input" data-peer-id="701"></div>
+            <div class="bubbles"><div class="bubbles-inner">
+              <div class="bubble is-in" data-peer-id="701" data-mid="60" data-timestamp="{now}">
+                <div class="message">菜单面板</div>
+                <div class="reply-markup"><button class="reply-markup-button" id="b1">✅ 点我签到</button></div>
+              </div>
+            </div></div>
+          </div>
+          <script>
+            document.querySelector('#b1').onclick = () => {{
+              const p = document.createElement('div');
+              p.className = 'popup popup-confirmation';
+              p.innerHTML = '<div class="popup-description">今日已签到，访问 <a href="https://example.invalid">示例链接</a></div><div class="popup-buttons"><button>好</button></div>';
+              p.querySelector('button').onclick = () => p.remove();
+              document.body.append(p);
+            }};
+          </script>
+        ''')
+        await self.engine.click_existing_button('✅ 点我签到', None, 0)
+        text = await self.engine.read_button_popup(1.5)
+        self.assertIn('今日已签到', text)
+        self.assertEqual(await self.page.locator('.popup-confirmation').count(), 0)
+
+        # Now verify button-label-only edit without popup or message body change
+        await self.page.evaluate('''() => {
+          document.querySelector('#b1').onclick = () => {
+            document.querySelector('#b1').textContent = '🎉 今日已签到';
+          };
+        }''')
+        boundary = await self.engine.snapshot_incoming()
+        mid = await self.engine.click_existing_button('✅ 点我签到', None, 0)
+        found = await self.engine.watch_new_incoming(
+            boundary, 1.0, 'reply_only', idle_after=0.05,
+            watch_button_mid=mid,
+            button_initial_text=self.engine._last_button_initial_text,
+            button_initial_buttons=self.engine._last_button_initial_buttons,
+            check_popup=True,
+        )
+        self.assertEqual(found, ['🎉 今日已签到'])
+        self.assertEqual(self.engine.last_evidence[0]['source'], 'button_popup')
+
+    async def test_scroll_chat_bottom_clicks_go_down_when_unread_slice_stays_empty(self):
+        self.engine._expected_peer = '-101'
+        await self.page.set_content('''
+          <div class="chat tabs-tab is-go-down-visible" style="display:none">
+            <div class="chat-info"><span class="peer-title" data-peer-id="-999">Cached</span></div>
+            <div class="bubbles"><div class="bubbles-scrollable" style="height:200px"><div class="bubbles-inner"></div></div></div>
+            <button class="bubbles-go-down">99</button>
+          </div>
+          <div class="chat tabs-tab active is-go-down-visible">
+            <div class="chat-info"><span class="peer-title" data-peer-id="-101">UnreadGroup</span></div>
+            <div class="bubbles"><div class="bubbles-scrollable" style="height:200px;overflow:auto"><div class="bubbles-inner"></div></div></div>
+            <button class="bubbles-go-down" id="active-jump" style="width:40px;height:40px">999</button>
+          </div>
+          <script>
+            document.querySelector('#active-jump').onclick = () => {
+              const chat = document.querySelector('.chat.active');
+              chat.classList.remove('is-go-down-visible');
+              document.querySelector('#active-jump').style.opacity = '0';
+              chat.querySelector('.bubbles-inner').innerHTML =
+                '<div class="bubble is-in" data-mid="300" data-peer-id="-101" data-timestamp="' + Math.floor(Date.now()/1000) + '"><div class="message">latest</div></div>';
+            };
+          </script>
+        ''')
+        started = time.monotonic()
+        boundary = await self.engine.snapshot_incoming()
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertIn('300', boundary['seen'])
+
 
 if __name__=='__main__': unittest.main()

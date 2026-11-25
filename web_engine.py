@@ -150,6 +150,9 @@ class WebEngine:
         self._login_verified = False
         self._self_peer = None
         self._last_send_confirmed_by_reply = False
+        self._last_button_mid = None
+        self._last_button_initial_text = None
+        self._last_button_initial_buttons = None
 
     # ---------- 基础 ----------
 
@@ -1221,14 +1224,44 @@ class WebEngine:
             raise RuntimeError('图片发送结果待核对，请先核对消息，不要直接重发') from error
         await self._track_sent_mid(pre_mid)
 
-    _CLICK_BUTTON_JS = r"""({allowed, privateChat, cutoff, seen, textPart, selectors}) => {
-        const normalize = v => String(v || '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F]/g, '').replace(/\s+/g, ' ').trim();
+    _ARM_POPUP_CAPTURE_JS = r"""() => {
+        const clean = v => String(v || '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F\uE000-\uF8FF]/g, '').trim();
+        const visible = el => el?.checkVisibility?.() && el.getBoundingClientRect().height > 0;
+        if (window.__checkinPopupCapture?.observer) window.__checkinPopupCapture.observer.disconnect();
+        const preToasts = new WeakSet([...document.querySelectorAll('.toast')].filter(visible));
+        const preDialogs = new WeakSet([...document.querySelectorAll('.popup-confirmation')].filter(visible));
+        const cap = {toasts: [], preToasts, preDialogs, observer: null};
+        const recordToast = el => {
+            if (!el?.matches?.('.toast') || preToasts.has(el)) return;
+            const text = clean(el.innerText || el.textContent);
+            if (text && !cap.toasts.includes(text)) cap.toasts.push(text);
+        };
+        cap.observer = new MutationObserver(mutations => {
+            for (const m of mutations) {
+                for (const node of m.addedNodes) {
+                    if (node.nodeType !== 1) continue;
+                    recordToast(node);
+                    if (node.querySelectorAll) node.querySelectorAll('.toast').forEach(recordToast);
+                }
+                const target = m.target.nodeType === 1 ? m.target : m.target.parentElement;
+                if (target) recordToast(target.closest('.toast'));
+            }
+        });
+        cap.observer.observe(document.body, {subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['class', 'style']});
+        window.__checkinPopupCapture = cap;
+    }"""
+
+    _CLICK_BUTTON_JS = r"""({peer, allowed, privateChat, cutoff, seen, textPart, selectors}) => {
+        const normalize = v => String(v || '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F\uE000-\uF8FF]/g, '').replace(/\s+/g, ' ').trim();
         const needle = normalize(textPart);
         const allowedSet = new Set(allowed.map(String));
         const seenSet = new Set(seen.map(String));
-        const bubbles = [...document.querySelectorAll('.bubbles .bubble.is-in')];
+        const activeChats = [...document.querySelectorAll('.chat.active')].filter(c => c.checkVisibility());
+        const root = activeChats.find(c => c.querySelector('.peer-title')?.dataset?.peerId === peer) || activeChats[0] || document;
+        const bubbles = [...root.querySelectorAll('.bubbles .bubble.is-in')];
         for (let i = bubbles.length - 1; i >= 0; i--) {
             const b = bubbles[i];
+            if (peer && b.dataset.peerId && b.dataset.peerId !== peer) continue;
             const mid = b.getAttribute('data-mid');
             const stamp = Number(b.getAttribute('data-timestamp') || 0);
             const replyTo = b.getAttribute('data-reply-to-mid');
@@ -1238,9 +1271,10 @@ class WebEngine:
             for (const btn of btns) {
                 const clone = (btn.querySelector('.reply-markup-button-text') || btn).cloneNode(true);
                 clone.querySelectorAll('img[alt]').forEach(img => img.replaceWith(img.alt));
+                clone.querySelectorAll('[data-sticker-emoji]').forEach(n => n.replaceWith(n.dataset.stickerEmoji || ''));
                 if (normalize(clone.textContent).includes(needle)) {
                     const isLink = !!btn.getAttribute('href') || !!btn.querySelector('a[href], [href]');
-                    return {el: btn, mid: mid ? String(mid) : null, isLink};
+                    return {el: btn, mid: mid ? String(mid) : null, ts: stamp, isLink};
                 }
             }
         }
@@ -1249,21 +1283,26 @@ class WebEngine:
 
     async def click_button(self, text_part, timeout=25):
         await self.assert_destination()
+        self._last_button_mid = None
+        self._last_button_initial_text = None
+        self._last_button_initial_buttons = None
         boundary = self._capture_by_chat.get(self._mids_chat, {})
         cutoff = boundary.get("cutoff", time.time())
         deadline = time.monotonic() + timeout
         selectors = ", ".join(SEL_BTN_ROW)
+        peer_str = str(self._expected_peer or "")
         while time.monotonic() < deadline:
             await self.assert_destination()
-            observed = await self.page.evaluate(self._IN_COLLECT_JS, {"peer": str(self._expected_peer), "reset": False})
+            observed = await self.page.evaluate(self._IN_COLLECT_JS, {"peer": peer_str, "reset": False})
             for old, new in observed.get("aliases", []):
                 if str(old) in self.last_sent_mids:
                     self.last_sent_mids.add(str(new))
                 if self._active_mids is not None and str(old) in self._active_mids:
                     self._active_mids.add(str(new))
-            private = bool(self._expected_peer and str(self._expected_peer).isdigit())
+            private = bool(peer_str and peer_str.isdigit())
             allowed = self._active_mids if self._active_mids is not None else self.last_sent_mids
             handle = await self.page.evaluate_handle(self._CLICK_BUTTON_JS, {
+                "peer": peer_str,
                 "allowed": sorted(str(x) for x in allowed),
                 "privateChat": private,
                 "cutoff": cutoff,
@@ -1274,14 +1313,27 @@ class WebEngine:
             try:
                 is_null = await handle.evaluate("v => !v")
                 if not is_null:
-                    meta = await handle.evaluate("v => ({mid: v.mid, isLink: v.isLink})")
+                    meta = await handle.evaluate("v => ({mid: v.mid, ts: v.ts, isLink: v.isLink})")
                     if meta.get("isLink"):
                         raise RuntimeError("匹配到网址按钮，已停止自动点击")
                     el_handle = await handle.get_property("el")
                     try:
                         button = el_handle.as_element()
                         if button:
+                            if meta.get("mid"):
+                                self._last_button_mid = str(meta["mid"])
+                                rec = next((r for r in observed.get("items", []) if str(r.get("mid")) == self._last_button_mid), None)
+                                if rec is not None:
+                                    self._last_button_initial_text = rec.get("t")
+                                    self._last_button_initial_buttons = list(rec.get("btns") or [])
+                            try:
+                                await button.evaluate("el => el.scrollIntoView({block: 'nearest'})")
+                            except Exception:
+                                pass
+                            if meta.get("ts") and 0 <= time.time() - float(meta["ts"]) < 0.4:
+                                await asyncio.sleep(min(0.18, max(0, deadline - time.monotonic())))
                             await self.assert_destination()
+                            await self.page.evaluate(self._ARM_POPUP_CAPTURE_JS)
                             await button.click(timeout=max(100, int((deadline - time.monotonic()) * 1000)))
                             self.send_started_monotonic = time.monotonic()
                             if meta.get("mid") and self._active_mids is not None:
@@ -1295,53 +1347,71 @@ class WebEngine:
         return False
 
     _EXISTING_BUTTON_JS = r"""({peer, mid, label, earliest, selectors}) => {
-        const normalize = value => String(value || '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F]/g,'').replace(/\s+/g,' ').trim();
+        const normalize = value => String(value || '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F\uE000-\uF8FF]/g,'').replace(/\s+/g,' ').trim();
+        const btnText = el => {
+            const text = (el.querySelector('.reply-markup-button-text') || el).cloneNode(true);
+            text.querySelectorAll('img[alt]').forEach(img => img.replaceWith(img.alt));
+            text.querySelectorAll('[data-sticker-emoji]').forEach(n => n.replaceWith(n.dataset.stickerEmoji || ''));
+            return normalize(text.textContent);
+        };
         const isSafeButton = el => el.matches('button:not([href], [disabled], [aria-disabled="true"], .is-disabled)') &&
             !el.querySelector('.reply-markup-button-icon, a, [href]');
-        const matches = rows => rows.filter(b => b.dataset.peerId === peer && b.checkVisibility() &&
-            (mid ? b.dataset.mid === mid : Number(b.dataset.timestamp) >= earliest - 5))
-            .flatMap(b => [...b.querySelectorAll(selectors)].filter(el => {
-                if (!el.checkVisibility() || el.parentElement?.closest(selectors) || !isSafeButton(el)) return false;
-                const text = (el.querySelector('.reply-markup-button-text') || el).cloneNode(true);
-                text.querySelectorAll('img[alt]').forEach(img => img.replaceWith(img.alt));
-                return normalize(text.textContent) === normalize(label);
-            }).map(el => ({el, mid:Number(b.dataset.mid), ts:Number(b.dataset.timestamp || 0)})));
-        const rows = [...document.querySelectorAll('.bubbles .bubble.is-in[data-mid]')];
-        const found = matches(rows).sort((a,b) => b.ts - a.ts || b.mid - a.mid);
+        const needle = normalize(label);
+        if (!needle) return null;
+        const activeChats = [...document.querySelectorAll('.chat.active')].filter(c => c.checkVisibility());
+        const root = activeChats.find(c => c.querySelector('.peer-title')?.dataset?.peerId === peer) || activeChats[0] || document;
+        const rows = [...root.querySelectorAll('.bubbles .bubble.is-in[data-mid]')].filter(b =>
+            b.dataset.peerId === peer && b.checkVisibility() &&
+            (mid ? b.dataset.mid === mid : (!earliest || Number(b.dataset.timestamp) >= earliest - 5)));
+        const collect = predicate => rows.flatMap(b => [...b.querySelectorAll(selectors)].filter(el =>
+            el.checkVisibility() && !el.parentElement?.closest(selectors) && isSafeButton(el) && predicate(btnText(el))
+        ).map(el => ({el, mid: Number(b.dataset.mid), ts: Number(b.dataset.timestamp || 0)})))
+            .sort((a, b) => b.ts - a.ts || b.mid - a.mid);
+        let found = collect(t => t === needle);
+        if (!found.length && needle.length >= 2) found = collect(t => t.includes(needle));
         if (!found.length || found[1]?.mid === found[0].mid) return null;
         return found[0].el;
     }"""
 
     _EXISTING_BUTTON_DIAG_JS = r"""({peer, mid, label, earliest, selectors}) => {
-        const normalize = value => String(value || '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F]/g,'').replace(/\s+/g,' ').trim();
+        const normalize = value => String(value || '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F\uE000-\uF8FF]/g,'').replace(/\s+/g,' ').trim();
+        const btnText = el => {
+            const text = (el.querySelector('.reply-markup-button-text') || el).cloneNode(true);
+            text.querySelectorAll('img[alt]').forEach(img => img.replaceWith(img.alt));
+            text.querySelectorAll('[data-sticker-emoji]').forEach(n => n.replaceWith(n.dataset.stickerEmoji || ''));
+            return normalize(text.textContent);
+        };
         const isSafeButton = el => el.matches('button:not([href], [disabled], [aria-disabled="true"], .is-disabled)') &&
             !el.querySelector('.reply-markup-button-icon, a, [href]');
         const needle = normalize(label);
-        const rows = [...document.querySelectorAll('.bubbles .bubble.is-in[data-mid]')].filter(b => b.dataset.peerId === peer && b.checkVisibility());
-        const inspect = bubble => [...bubble.querySelectorAll(selectors)].filter(el => {
-            if (!el.checkVisibility() || el.parentElement?.closest(selectors)) return false;
-            const text = (el.querySelector('.reply-markup-button-text') || el).cloneNode(true);
-            text.querySelectorAll('img[alt]').forEach(img => img.replaceWith(img.alt));
-            return normalize(text.textContent) === needle;
-        }).map(el => ({safe: isSafeButton(el), mid: bubble.dataset.mid, ts: Number(bubble.dataset.timestamp || 0)}));
-        const inScope = rows.filter(b => mid ? b.dataset.mid === mid : Number(b.dataset.timestamp) >= earliest - 5);
+        const matchesLabel = t => t === needle || (needle.length >= 2 && t.includes(needle));
+        const activeChats = [...document.querySelectorAll('.chat.active')].filter(c => c.checkVisibility());
+        const root = activeChats.find(c => c.querySelector('.peer-title')?.dataset?.peerId === peer) || activeChats[0] || document;
+        const rows = [...root.querySelectorAll('.bubbles .bubble.is-in[data-mid]')].filter(b => b.dataset.peerId === peer && b.checkVisibility());
+        const inspect = bubble => [...bubble.querySelectorAll(selectors)].filter(el =>
+            el.checkVisibility() && !el.parentElement?.closest(selectors) && matchesLabel(btnText(el))
+        ).map(el => ({safe: isSafeButton(el), mid: bubble.dataset.mid, ts: Number(bubble.dataset.timestamp || 0)}));
+        const inScope = rows.filter(b => mid ? b.dataset.mid === mid : (!earliest || Number(b.dataset.timestamp) >= earliest - 5));
         const scopeMatches = inScope.flatMap(inspect);
         const safeInScope = scopeMatches.filter(m => m.safe);
         const unsafeInScope = scopeMatches.filter(m => !m.safe);
-        const olderSafe = mid ? [] : rows.filter(b => Number(b.dataset.timestamp) < earliest - 5).flatMap(inspect).filter(m => m.safe);
+        const olderSafe = (mid || !earliest) ? [] : rows.filter(b => Number(b.dataset.timestamp) < earliest - 5).flatMap(inspect).filter(m => m.safe);
         olderSafe.sort((a, b) => b.ts - a.ts);
         return {
             midFound: mid ? inScope.length > 0 : null,
             duplicateSafe: safeInScope.length >= 2,
             unsafeCount: unsafeInScope.length,
             latestOlderTs: olderSafe.length ? olderSafe[0].ts : null,
+            hasBotMessagesWithoutMatch: !mid && rows.length > 0 && !scopeMatches.length && !olderSafe.length,
         };
     }"""
 
-    async def click_existing_button(self, label, reference, earliest):
+    async def click_existing_button(self, label, reference, earliest=0):
         """Click one incoming message's inline button within the verified conversation."""
         await self.assert_destination()
+        self._last_button_mid = None
         self._last_button_initial_text = None
+        self._last_button_initial_buttons = None
         peer, mid = str(self._expected_peer), None
         if reference:
             mid, linked_peer, linked_topic = button_message_ref(reference)
@@ -1359,7 +1429,7 @@ class WebEngine:
             await self.page.evaluate('route => { location.hash = route; }', route)
         elif not peer.isdigit():
             raise ValueError("群聊的仅按钮签到需要指定消息链接或数字消息 ID")
-        args = {'peer':peer, 'mid':mid, 'label':label, 'earliest':earliest, 'selectors':', '.join(SEL_BTN_ROW)}
+        args = {'peer':peer, 'mid':mid, 'label':label, 'earliest':earliest or 0, 'selectors':', '.join(SEL_BTN_ROW)}
         try:
             handle = await self.page.wait_for_function(self._EXISTING_BUTTON_JS, arg=args, timeout=5000)
         except PlaywrightTimeoutError as error:
@@ -1375,6 +1445,8 @@ class WebEngine:
                 elif diag.get('latestOlderTs'):
                     when = datetime.fromtimestamp(diag['latestOlderTs'], ZoneInfo(timezone_name(self.cfg))).strftime('%Y-%m-%d %H:%M')
                     reason = f"今天尚未收到包含按钮「{label}」的新消息（最近匹配消息时间 {when}），未点击历史按钮；若需点击固定旧消息，请在规则中填写按钮消息链接或 ID"
+                elif diag.get('hasBotMessagesWithoutMatch'):
+                    reason = f"当前会话未找到可点击按钮「{label}」（可能今日已点击并由机器人收起按钮，或尚未收到新面板）"
             except Exception:
                 pass
             raise RuntimeError(reason) from error
@@ -1383,20 +1455,21 @@ class WebEngine:
             await self.assert_destination()
             if await self.page.locator('.popup-confirmation:visible').count():
                 raise RuntimeError("当前已有 Telegram 弹窗，请先处理后再运行签到")
-            meta = await button.evaluate(r"""el => {
-                const b = el.closest('.bubble');
-                const message = b?.querySelector('.message');
-                const body = (message?.querySelector('[data-message-text-source]') || message)?.cloneNode(true);
-                if (body) {
-                    body.querySelectorAll('img[alt]').forEach(img => img.replaceWith(img.alt));
-                    body.querySelectorAll('.time, .reactions, .reply-markup').forEach(n => n.remove());
-                }
-                return {mid: b?.dataset.mid || null, text: (body ? body.textContent : '').trim()};
-            }""")
-            origin = meta['mid']
-            self._last_button_initial_text = meta['text']
+            origin = await button.evaluate("el => el.closest('.bubble')?.dataset?.mid || null")
+            self._last_button_mid = str(origin) if origin else None
+            observed = await self.page.evaluate(self._IN_COLLECT_JS, {'peer': peer, 'reset': False})
+            if self._last_button_mid:
+                rec = next((r for r in observed.get('items', []) if str(r.get('mid')) == self._last_button_mid), None)
+                if rec is not None:
+                    self._last_button_initial_text = rec.get('t', '')
+                    self._last_button_initial_buttons = list(rec.get('btns') or [])
+            try:
+                await button.evaluate("el => el.scrollIntoView({block: 'nearest'})")
+            except Exception:
+                pass
             if self.before_send:
                 await self.before_send()
+            await self.page.evaluate(self._ARM_POPUP_CAPTURE_JS)
             capture_since = time.time()
             try:
                 await button.click(timeout=2000)
@@ -1417,19 +1490,28 @@ class WebEngine:
             return ''
         try:
             handle = await self.page.wait_for_function(r"""() => {
+                const clean = v => String(v || '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F\uE000-\uF8FF]/g, '').trim();
                 const visible = el => el.checkVisibility() && el.getBoundingClientRect().height > 0;
-                const dialogs = [...document.querySelectorAll('.popup-confirmation')].filter(visible);
+                const cap = window.__checkinPopupCapture;
+                const dialogs = [...document.querySelectorAll('.popup-confirmation')].filter(el => visible(el) && !cap?.preDialogs?.has(el));
                 if (dialogs.length === 1) {
                     const popup = dialogs[0];
                     const buttons = [...popup.querySelectorAll('.popup-buttons button, .popup-footer button')].filter(visible);
-                    const okBtn = buttons.length === 1 && !popup.querySelector('input, textarea, select, a[href]');
-                    const desc = popup.querySelector('.popup-description')?.textContent.trim();
+                    const okBtn = buttons.length === 1 && !popup.querySelector('input, textarea, select');
+                    const descEl = popup.querySelector('.popup-description, .popup-body, .popup-text');
+                    const desc = clean(descEl ? (descEl.innerText || descEl.textContent) : '');
                     if (okBtn && desc) return {kind: 'popup', el: popup, text: desc};
                 }
-                const toasts = [...document.querySelectorAll('.toast')].filter(visible);
-                if (toasts.length === 1) {
-                    const text = toasts[0].innerText.trim();
-                    if (text) return {kind: 'toast', el: toasts[0], text};
+                if (cap?.toasts?.length) {
+                    const text = cap.toasts[cap.toasts.length - 1];
+                    cap.toasts.length = 0;
+                    if (text) return {kind: 'toast', el: null, text};
+                }
+                const toasts = [...document.querySelectorAll('.toast')].filter(el => visible(el) && !cap?.preToasts?.has(el));
+                if (toasts.length >= 1) {
+                    const latest = toasts[toasts.length - 1];
+                    const text = clean(latest.innerText || latest.textContent);
+                    if (text) return {kind: 'toast', el: latest, text};
                 }
                 return null;
             }""", timeout=max(1, int(remaining*1000)))
@@ -1444,7 +1526,10 @@ class WebEngine:
             try:
                 popup = el_handle.as_element()
                 await self.assert_destination()
-                text = await popup.eval_on_selector('.popup-description', 'el => el.innerText.trim()')
+                text = await popup.evaluate(r"""el => {
+                    const d = el.querySelector('.popup-description, .popup-body, .popup-text');
+                    return String(d ? (d.innerText || d.textContent) : '').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F\uE000-\uF8FF]/g, '').trim();
+                }""") or info['text']
                 button = await popup.query_selector('.popup-buttons button:visible, .popup-footer button:visible')
                 try:
                     if button:
@@ -1472,17 +1557,19 @@ class WebEngine:
             const r=el.getBoundingClientRect();
             return r.width>0&&(empty||r.height>0)&&r.left<innerWidth&&r.right>0&&(empty||r.top<innerHeight&&r.bottom>0);
         };
-        const button=[...document.querySelectorAll('button.bubbles-go-down')].find(b=>{
+        const activeChats=[...document.querySelectorAll('.chat.active')].filter(c=>visible(c,true));
+        const root=activeChats.find(c=>c.querySelector('.peer-title')?.dataset?.peerId===peer)||activeChats[0]||document;
+        const button=[...root.querySelectorAll('button.bubbles-go-down')].find(b=>{
             if(!visible(b)||b.disabled)return false;
             const r=b.getBoundingClientRect(),top=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);
             return top===b||b.contains(top);
         });
         if(element)return button||null;
-        const pane=[...document.querySelectorAll('.bubbles')].find(e=>visible(e,true));
+        const pane=[...root.querySelectorAll('.bubbles')].find(e=>visible(e,true));
         const owner=button?.closest('.chat')||pane?.closest('.chat');
         const pending=owner?owner.classList.contains('is-go-down-visible'):!!button;
-        const bubble=[...document.querySelectorAll('.bubbles .bubble[data-mid]')].find(b=>b.dataset.peerId===peer&&visible(b));
-        const empty=[...document.querySelectorAll('.bubbles-inner.no-messages')].some(e=>visible(e,true));
+        const bubble=[...root.querySelectorAll('.bubbles .bubble[data-mid]')].find(b=>b.dataset.peerId===peer&&visible(b));
+        const empty=[...root.querySelectorAll('.bubbles-inner.no-messages')].some(e=>visible(e,true));
         let scrolled=false;
         const viewport=pane?.querySelector('.bubbles-scrollable');
         const initial_loading=!!viewport&&!bubble&&!empty&&viewport.scrollHeight<=viewport.clientHeight+10;
@@ -1501,17 +1588,19 @@ class WebEngine:
 
     async def _scroll_chat_bottom(self):
         await self.assert_destination()
-        deadline=time.monotonic()+18
+        started=time.monotonic()
+        deadline=started+18
         attempts=0;last_click=0;settled=None;stuck_since=None
         while time.monotonic()<deadline:
             current=time.monotonic()
             align=attempts>0 or (stuck_since is not None and current-stuck_since>=.4)
             state=await self.page.evaluate(self._LATEST_VIEW_JS,{'peer':str(self._expected_peer),'align':align})
-            if state['has_jump'] and not state['clickable'] and not state['initial_loading']:
+            waiting_initial=state['initial_loading'] and (current-started)<.9
+            if state['has_jump'] and not state['clickable'] and not waiting_initial:
                 stuck_since=stuck_since or current
             else:
                 stuck_since=None
-            if state['has_jump'] and state['clickable'] and not state['initial_loading'] and attempts<6 and current-last_click>=(.8 if state['ready'] else 2):
+            if state['has_jump'] and state['clickable'] and not waiting_initial and attempts<10 and current-last_click>=(.8 if state['ready'] else 1.0):
                 handle=await self.page.evaluate_handle(self._LATEST_VIEW_JS,{'peer':str(self._expected_peer),'element':True})
                 try:
                     button=handle.as_element()
@@ -1520,7 +1609,7 @@ class WebEngine:
                         try:await button.click(timeout=800)
                         except Exception:pass  # The navigation control can disappear during a valid jump.
                 finally:await handle.dispose()
-            if (state['ready'] or str(self._expected_peer).isdigit()) and not state['initial_loading'] and not state['has_jump'] and not state['scrolled']:
+            if (state['ready'] or str(self._expected_peer).isdigit()) and not waiting_initial and not state['has_jump'] and not state['scrolled']:
                 settled=settled or current
                 if current-settled>=.15:
                     await self.assert_destination()
@@ -1558,9 +1647,15 @@ class WebEngine:
                     }else{
                         text=b.textContent||'';
                     }
-                    const t=text.trim().replace(/(?:\s*(?:edited|已编辑))?(?:\s*\d{1,2}:\d{2}(?:\s*[AP]M)?){1,2}\s*$/i, '').trim();
+                    const t=text.replace(/[\uE000-\uF8FF]/g, '').trim().replace(/(?:\s*(?:edited|已编辑))?(?:\s*\d{1,2}:\d{2}(?:\s*[AP]M)?){1,2}\s*$/i, '').trim();
+                    const btns=[...b.querySelectorAll('.reply-markup-button, .btn-reply-markup, .reply-markup .btn-item')].filter(el=>el.checkVisibility()).map(el=>{
+                        const c=(el.querySelector('.reply-markup-button-text')||el).cloneNode(true);
+                        c.querySelectorAll('img[alt]').forEach(img=>img.replaceWith(img.alt));
+                        c.querySelectorAll('[data-sticker-emoji]').forEach(n=>n.replaceWith(n.dataset.stickerEmoji||''));
+                        return (c.textContent||'').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F\uE000-\uF8FF]/g,'').replace(/\s+/g,' ').trim();
+                    }).filter(Boolean);
                     const mentions=[...new Set([...rawBody?.querySelectorAll('[data-follow]')||[]].map(e=>e.getAttribute('data-follow')).filter(id=>/^\d+$/.test(id)))];
-                    const record={mid,t,rm:b.getAttribute('data-reply-to-mid'),ts:Number(b.getAttribute('data-timestamp')||0),
+                    const record={mid,t,btns,rm:b.getAttribute('data-reply-to-mid'),ts:Number(b.getAttribute('data-timestamp')||0),
                                   peer:options.peer,mentions,out:b.classList.contains('is-out'),pending:b.classList.contains('is-sending')||mid.includes('.')};
                     capture.records.set(mid,record);
                     if(capture.records.size>1000)capture.records.delete(capture.records.keys().next().value);
@@ -1689,7 +1784,7 @@ class WebEngine:
         self._capture_by_chat[self._mids_chat] = baseline
         return baseline
 
-    async def watch_new_incoming(self, known, seconds, mode="after", idle_after=2.0, sent_mids=None, started_at=None, is_complete=None, *, watch_button_mid=None, button_initial_text=None, check_popup=False):
+    async def watch_new_incoming(self, known, seconds, mode="after", idle_after=2.0, sent_mids=None, started_at=None, is_complete=None, *, watch_button_mid=None, button_initial_text=None, button_initial_buttons=None, check_popup=False):
         if not isinstance(known, dict) or not known.get("peer"):
             raise ValueError("缺少本轮消息 ID/时间边界，不能安全补查旧记录")
         seen = set(known.get("seen", []))
@@ -1703,6 +1798,7 @@ class WebEngine:
         last_related = None
         first_read = True
         button_mid_str = str(watch_button_mid) if watch_button_mid else None
+        initial_btns_set = set(button_initial_buttons) if button_initial_buttons is not None else None
         while first_read or time.monotonic() < deadline:
             first_read = False
             if check_popup:
@@ -1730,10 +1826,15 @@ class WebEngine:
                 self.last_sent_mids.update(allowed)
             for record in data.get("items", []):
                 mid = str(record["mid"])
-                if record.get("out") or not record.get("t"):
+                if record.get("out"):
                     continue
                 exact = str(record.get("rm")) in allowed
-                edited_button = bool(button_mid_str and mid == button_mid_str and button_initial_text is not None and record['t'] != button_initial_text)
+                edited_text = bool(button_mid_str and mid == button_mid_str and button_initial_text is not None and record.get('t', '') != button_initial_text)
+                new_btns = [lbl for lbl in (record.get('btns') or []) if lbl not in initial_btns_set] if (button_mid_str and mid == button_mid_str and initial_btns_set is not None) else []
+                edited_button = edited_text or bool(new_btns)
+                effective_text = record.get("t") if (edited_text or not new_btns) else " / ".join(new_btns)
+                if not effective_text:
+                    continue
                 if not exact and not edited_button and record.get("ts", 0) < int(known["cutoff"]) - 5:
                     continue
                 private = str(known["peer"]).isdigit()
@@ -1745,22 +1846,22 @@ class WebEngine:
                         await self.assert_destination()
                     mentioned_self = bool(own and record["mentions"] == [own])
                 relation = 'button_edit' if edited_button else ('reply:' + str(record.get('rm')) if exact else 'mention:' + str(record['mentions'][0]) if mentioned_self else 'private' if private else 'unrelated')
-                if not edited_button and mid in seen and (mid not in known['versions'] or known['versions'][mid] == record['t'] and relations.get(mid, 'unrelated') == relation):
+                if not edited_button and mid in seen and (mid not in known['versions'] or known['versions'][mid] == effective_text and relations.get(mid, 'unrelated') == relation):
                     continue
-                if edited_button and known['versions'].get(mid) == record['t'] and relations.get(mid) == 'button_edit':
+                if edited_button and known['versions'].get(mid) == effective_text and relations.get(mid) == 'button_edit':
                     continue
                 if not exact and not mentioned_self and not private and not edited_button and mode == "reply_only":
                     continue
                 seen.add(mid)
                 known["seen"] = sorted(seen)
-                known["versions"][mid] = record["t"]
+                known["versions"][mid] = effective_text
                 relations[mid] = relation
-                found.append(record["t"])
+                found.append(effective_text)
                 source = "button_popup" if edited_button else ("reply_to_sent" if exact else "mention_self" if mentioned_self else "private_chat" if private else "unrelated")
-                record = {**record, "source": source}
+                record = {**record, "t": effective_text, "source": source}
                 evidence.append(record)
                 if exact or mentioned_self or private or edited_button:
-                    replied.append(record["t"])
+                    replied.append(effective_text)
                     last_related = time.monotonic()
             if last_related is not None and time.monotonic() - last_related >= idle_after and (is_complete is None or is_complete(replied)):
                 break

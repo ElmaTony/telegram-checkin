@@ -90,6 +90,28 @@ class AuditFixUnitTests(unittest.TestCase):
         self.assertNotIn(KEY, result['error'])
         self.assertLessEqual(len(notifications._truncate_utf8('中' * 15000, 28000).encode('utf-8')), 28000)
 
+        import ssl
+        import urllib.error
+
+        class DirectOK:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self, n): return b'{"code":0}'
+
+        class FakeOpener:
+            def __init__(self): self.calls = 0
+            def open(self, req, timeout=15):
+                self.calls += 1
+                return DirectOK()
+
+        fake_opener = FakeOpener()
+        with patch.object(notifications.urllib.request, 'getproxies', return_value={'https': 'http://127.0.0.1:7897'}), \
+             patch.object(notifications.urllib.request, 'urlopen', side_effect=urllib.error.URLError(ssl.SSLError('handshake eof'))), \
+             patch.object(notifications.urllib.request, 'build_opener', return_value=fake_opener):
+            fallback_res = notifications._post(KEY, '标题', '正文')
+        self.assertTrue(fallback_res['ok'])
+        self.assertEqual(fake_opener.calls, 1)
+
     def test_resolve_proxy_supports_direct_and_authenticated_url(self):
         self.assertIsNone(web_engine.resolve_proxy({'web_proxy': 'direct'}))
         self.assertIsNone(web_engine.resolve_proxy({'web_proxy': 'NONE'}))
@@ -310,6 +332,83 @@ class AuditFixGuiTests(unittest.TestCase):
         self.assertEqual(eng.sends, 1)
         self.assertIsNone(err)
         self.assertEqual(actions[0]['confirm'], 'success')
+
+    def test_already_signed_verdict_mention_source_and_button_runner_wiring(self):
+        self.assertEqual(logic.judge_replies({}, {}, ['您今天已经签到过了'], ['您今天已经签到过了']), 'success')
+        self.assertEqual(logic.judge_replies({}, {}, ['签到失败，您今天已经签到过了'], ['签到失败，您今天已经签到过了']), 'success')
+        self.assertEqual(logic.judge_replies({}, {}, ['签到失败，积分不足'], ['签到失败，积分不足']), 'failed')
+
+        mention_res = runner._result({'chat': '-101', 'title': '示例群'}, [{
+            'ok': True, 'clicked': False, 'with_image': False, 'sent': True, 'confirm': 'success', 'error': None,
+            'replies': ['示例用户 签到成功'], 'trusted_replies': ['示例用户 签到成功'],
+            'evidence': [{'source': 'mention_self', 'mid': '88', 't': '示例用户 签到成功'}],
+        }])
+        self.assertEqual(mention_res['source'], 'mention_self')
+
+        from contextlib import asynccontextmanager
+
+        class ButtonFakeEngine:
+            def __init__(self):
+                self.earliest_seen = None
+                self.watch_kwargs = []
+                self.last_draft_warning = None
+                self.last_sent_mids = set()
+                self.last_replied = ['签到成功 +10']
+                self.last_evidence = [{'source': 'button_popup', 'mid': '40', 't': '签到成功 +10'}]
+                self.last_allowed_mids = []
+                self._expected_peer = '701'
+                self._last_actual_peer = '701'
+                self.send_started_at = 1.0
+                self.send_started_monotonic = 1.0
+                self.before_send = None
+                self._next_send_at = 0
+                self._active_mids = set()
+                self._last_button_mid = '40'
+                self._last_button_initial_text = '请选择'
+                self._last_button_initial_buttons = ['确认签到']
+
+            async def open_chat(self, *args, require_composer=True, **kwargs): pass
+            async def assert_destination(self): pass
+            async def opened_chat_info(self): return {'pid': '701', 'title': '示例机器人'}
+            @asynccontextmanager
+            async def preserve_draft(self): yield
+            async def snapshot_incoming(self, mode='after'): return {'peer': '701', 'cutoff': 1.0, 'seen': []}
+            async def click_existing_button(self, label, reference, earliest=0):
+                self.earliest_seen = earliest
+                if self.before_send:
+                    await self.before_send()
+                return '40'
+            async def send_text(self, text):
+                if self.before_send:
+                    await self.before_send()
+                self.last_sent_mids.add('10')
+            async def click_button(self, label):
+                self._active_mids.add('40')
+                return True
+            async def watch_new_incoming(self, known, seconds, mode='after', idle_after=2.0, sent_mids=None, started_at=None, is_complete=None, *, watch_button_mid=None, button_initial_text=None, button_initial_buttons=None, check_popup=False):
+                self.watch_kwargs.append({
+                    'sent_mids': list(sent_mids or []),
+                    'watch_button_mid': watch_button_mid,
+                    'button_initial_buttons': button_initial_buttons,
+                    'check_popup': check_popup,
+                })
+                self.last_allowed_mids = sorted(sent_mids or [])
+                return ['签到成功 +10']
+
+        eng = ButtonFakeEngine()
+        _, acts_btn, _, _ = asyncio.run(runner._send_group_actions(
+            eng, {}, 'A', {'chat': '701', 'method': 'button_only', 'click_button': '点我签到'}, {'reply_wait_seconds': 0.05}, 0, 0, today='2026-11-25'))
+        self.assertEqual(eng.earliest_seen, 0)
+        self.assertEqual(acts_btn[0]['confirm'], 'success')
+        self.assertTrue(eng.watch_kwargs[0]['check_popup'])
+
+        eng2 = ButtonFakeEngine()
+        _, acts_cmd, _, _ = asyncio.run(runner._send_group_actions(
+            eng2, {}, 'A', {'chat': '701', 'method': 'command_button', 'message': '/checkin', 'click_button': '确认签到'}, {'reply_wait_seconds': 0.05}, 0, 0, today='2026-11-25'))
+        self.assertEqual(acts_cmd[0]['confirm'], 'success')
+        self.assertTrue(eng2.watch_kwargs[0]['check_popup'])
+        self.assertEqual(eng2.watch_kwargs[0]['watch_button_mid'], '40')
+        self.assertEqual(acts_cmd[0]['sent_mids'], ['10'])
 
 
 if __name__ == '__main__':

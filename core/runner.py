@@ -100,7 +100,7 @@ def _result(group, actions, engine=None, error=None, cfg=None):
     warning = '；'.join(action['warning'] for action in actions if action.get('warning'))
     draft_warning = '；'.join(action['draft_warning'] for action in actions if action.get('draft_warning')) or getattr(engine,'last_draft_warning',None) or ''
     sources = {item.get('source') for item in evidence}
-    source = next((kind for kind in ('button_popup', 'reply_to_sent', 'private_chat') if kind in sources), 'unknown')
+    source = next((kind for kind in ('button_popup', 'reply_to_sent', 'mention_self', 'private_chat') if kind in sources), 'unknown')
     waiting = '已点击按钮，尚未取得可关联的反馈' if any(action.get('button_only') for action in actions) else '已发送，尚未捕获与本轮消息关联的签到反馈'
     return {'chat': str(group['chat']), 'name': group.get('title') or str(group['chat']),
             'ok': merged['ok'] and not error, 'confirm': confirm,
@@ -170,9 +170,11 @@ async def _wait_until(deadline):
         await asyncio.sleep(remaining)
 
 
-async def _watch_feedback(engine, boundary, group, cfg, *, sent_mids, started_at=None, **extra):
+async def _watch_feedback(engine, boundary, group, cfg, *, sent_mids, started_at=None, min_wait=0.0, **extra):
+    configured_wait = float(cfg.get('reply_wait_seconds', 6))
+    wait_seconds = max(configured_wait, min_wait) if configured_wait >= 1.0 else configured_wait
     return await engine.watch_new_incoming(
-        boundary, float(cfg.get('reply_wait_seconds', 6)),
+        boundary, wait_seconds,
         group.get('reply_mode') or cfg.get('reply_mode') or 'reply_only',
         idle_after=0.8,
         sent_mids=sent_mids, started_at=started_at,
@@ -200,7 +202,7 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi, today=
         _progress(name, '准备动作', group, action=index, sent_at=group_sent_at)
         before = set(engine.last_sent_mids)
         boundary = {}
-        action = {'ok': False, 'clicked': False, 'with_image': False, 'error': None,
+        action = {'method': method, 'ok': False, 'clicked': False, 'with_image': False, 'error': None,
                   'sent': False, 'replies': [], 'trusted_replies': [], 'evidence': [],
                   'confirm': 'unconfirmed', 'boundary': boundary, 'sent_mids': []}
         if method in ('command_button', 'button_only'):
@@ -234,8 +236,7 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi, today=
             engine.before_send = before_dispatch
             if button_only:
                 boundary['button_only'] = True
-                today_start = local_now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-                action['button_mid'] = await engine.click_existing_button(configured['click_button'], configured.get('button_message'), today_start)
+                action['button_mid'] = await engine.click_existing_button(configured['click_button'], configured.get('button_message'), 0)
                 action.update(clicked=True, buttons_complete=True)
             elif method in ('image_text', 'image_only'):
                 action['with_image'] = True
@@ -249,8 +250,9 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi, today=
                 action['confirmed_by_reply'] = True
             engine._next_send_at = (getattr(engine, 'send_started_monotonic', None) or time.monotonic()) + random.uniform(lo, hi)
             group_sent_at = group_sent_at or getattr(engine, 'send_started_at', None)
-            action['sent_mids'] = sorted(engine.last_sent_mids - before)
-            engine._active_mids = set(action['sent_mids'])
+            outgoing_mids = sorted(engine.last_sent_mids - before)
+            action['sent_mids'] = list(outgoing_mids)
+            engine._active_mids = set(outgoing_mids)
             if method == 'command_button':
                 checkpoint(known_sent=True)
                 _progress(name, '点击按钮', group, action=index, sent_at=group_sent_at)
@@ -258,22 +260,26 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi, today=
                     if not await engine.click_button(button):
                         raise RuntimeError(f'未找到本轮消息对应的按钮「{button}」；已发送口令，请勿直接重发')
                     action['clicked'] = True
+                if getattr(engine, '_last_button_mid', None):
+                    action['button_mid'] = engine._last_button_mid
                 action['buttons_complete'] = True
             action['ok'] = True
-            action['sent_mids'] = sorted(engine._active_mids)
+            action['sent_mids'] = sorted(outgoing_mids)
             checkpoint(known_sent=True)
             _progress(name, '等待反馈', group, action=index, sent_at=group_sent_at)
+            watch_sig = inspect.signature(engine.watch_new_incoming).parameters
             if button_only:
-                watch_sig = inspect.signature(engine.watch_new_incoming).parameters
                 if 'check_popup' in watch_sig:
                     watch_extra = {
                         'check_popup': True,
                         'watch_button_mid': action.get('button_mid'),
                         'button_initial_text': getattr(engine, '_last_button_initial_text', None),
                     }
+                    if 'button_initial_buttons' in watch_sig:
+                        watch_extra['button_initial_buttons'] = getattr(engine, '_last_button_initial_buttons', None)
                     action['replies'] = await _watch_feedback(
                         engine, boundary, group, cfg, sent_mids=action['sent_mids'],
-                        started_at=getattr(engine, 'send_started_monotonic', None), **watch_extra,
+                        started_at=getattr(engine, 'send_started_monotonic', None), min_wait=8.0, **watch_extra,
                     )
                     action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
                     action['trusted_replies'] = list(engine.last_replied)
@@ -285,13 +291,28 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi, today=
                             {'source': 'button_popup', 't': popup, 'mid': action['button_mid'], 'ts': time.time()}
                         ])
                     else:
-                        action['replies'] = await _watch_feedback(engine, boundary, group, cfg, sent_mids=action['sent_mids'], started_at=getattr(engine, 'send_started_monotonic', None))
+                        action['replies'] = await _watch_feedback(engine, boundary, group, cfg, sent_mids=action['sent_mids'], started_at=getattr(engine, 'send_started_monotonic', None), min_wait=8.0)
                         action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
                         action['trusted_replies'] = list(engine.last_replied)
                         action['evidence'] = list(engine.last_evidence)
             else:
-                action['replies'] = await _watch_feedback(engine, boundary, group, cfg, sent_mids=action['sent_mids'], started_at=getattr(engine, 'send_started_monotonic', None))
-                action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
+                watch_extra = {}
+                if method == 'command_button' and action.get('clicked') and 'check_popup' in watch_sig:
+                    watch_extra = {
+                        'check_popup': True,
+                        'watch_button_mid': action.get('button_mid'),
+                        'button_initial_text': getattr(engine, '_last_button_initial_text', None),
+                    }
+                    if 'button_initial_buttons' in watch_sig:
+                        watch_extra['button_initial_buttons'] = getattr(engine, '_last_button_initial_buttons', None)
+                reply_target_mids = sorted(engine._active_mids) if method == 'command_button' else action['sent_mids']
+                action['replies'] = await _watch_feedback(
+                    engine, boundary, group, cfg, sent_mids=reply_target_mids,
+                    started_at=getattr(engine, 'send_started_monotonic', None),
+                    min_wait=8.0 if method == 'command_button' else 0.0, **watch_extra,
+                )
+                allowed_after = [m for m in getattr(engine, 'last_allowed_mids', action['sent_mids']) if m in set(outgoing_mids) or m not in {action.get('button_mid')}]
+                action['sent_mids'] = allowed_after if outgoing_mids else action['sent_mids']
                 action['trusted_replies'] = list(engine.last_replied)
                 action['evidence'] = list(engine.last_evidence)
             action['confirm'] = _judge_action(group, cfg, action)
@@ -324,7 +345,15 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi, today=
                 # Keep the observer alive even when a bot deleted the outgoing bubble too soon.
                 try:
                     watch_sig = inspect.signature(engine.watch_new_incoming).parameters
-                    watch_extra = {'check_popup': True, 'watch_button_mid': action.get('button_mid'), 'button_initial_text': getattr(engine, '_last_button_initial_text', None)} if (button_only and 'check_popup' in watch_sig) else {}
+                    watch_extra = {}
+                    if (button_only or (method == 'command_button' and action.get('clicked'))) and 'check_popup' in watch_sig:
+                        watch_extra = {
+                            'check_popup': True,
+                            'watch_button_mid': action.get('button_mid'),
+                            'button_initial_text': getattr(engine, '_last_button_initial_text', None),
+                        }
+                        if 'button_initial_buttons' in watch_sig:
+                            watch_extra['button_initial_buttons'] = getattr(engine, '_last_button_initial_buttons', None)
                     action['replies'] = await _watch_feedback(engine, boundary, group, cfg, sent_mids=action['sent_mids'], started_at=getattr(engine, 'send_started_monotonic', None), **watch_extra)
                     action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
                     action['trusted_replies'] = list(engine.last_replied)

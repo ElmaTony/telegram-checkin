@@ -13,11 +13,12 @@ _BUTTON_PATH = re.compile(
     r"^/(?:(?:c/(?P<chat>[1-9]\d*))|(?P<username>[A-Za-z][A-Za-z0-9_]{2,}))"
     r"/(?P<first>[1-9]\d*)(?:/(?P<second>[1-9]\d*))?$"
 )
-DEFAULT_SUCCESS_KW = ["签到成功", "打卡成功", "签到完成", "已签到", "成功"]
+DEFAULT_SUCCESS_KW = ["签到成功", "打卡成功", "签到完成", "已签到", "已经签到", "已签过", "今日已签", "今天已签", "成功"]
 DEFAULT_FAIL_KW = ["签到失败", "打卡失败", "失败", "禁言", "被禁", "封禁", "错误", "无法", "异常"]
 _GENERIC_RESULT_WORDS = {"成功", "失败", "禁言", "被禁", "封禁", "错误", "无法", "异常"}
 _CONFIRMATION_PROMPT = re.compile(r"(?:是否|要不要)[^。！？\n]{0,16}(?:继续|确认)[^。！？\n]{0,12}(?:签到|打卡)")
 _EXPLICIT_RESULT = re.compile(r"(?:签到|打卡)(?:已)?(?:成功|完成|失败|错误|异常)|已签到|(?:无法|不能|禁止)(?:完成)?(?:签到|打卡)")
+_ALREADY_SIGNED = re.compile(r"(?:今日|今天)?(?:已经|已)(?:完成)?(?:签到|打卡|签过)|请勿重复(?:签到|打卡)")
 
 
 def _pending_confirmation(text):
@@ -197,9 +198,12 @@ def judge_replies(g, cfg, replies, replied=None):
     # 这类泛词随机出现（游戏结算、日常吐槽），命中即误判成失败
     eff_fail = fail if exact else [k for k in fail
                                    if ("签" in str(k) or "打卡" in str(k))]
+    succ_hit = any(_kw_hit(terminal_text if str(k).strip() in _GENERIC_RESULT_WORDS else text, k) for k in succ)
+    if succ_hit and _ALREADY_SIGNED.search(terminal_text or text):
+        return "success"
     if any(_kw_hit(terminal_text if str(k).strip() in _GENERIC_RESULT_WORDS else text, k) for k in eff_fail):
         return "failed"
-    if any(_kw_hit(terminal_text if str(k).strip() in _GENERIC_RESULT_WORDS else text, k) for k in succ):
+    if succ_hit:
         return "success"
     return "unconfirmed"
 

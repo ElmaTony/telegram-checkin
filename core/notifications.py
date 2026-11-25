@@ -105,15 +105,22 @@ def _post(key, title, description, *, short=''):
     payload = urllib.parse.urlencode(fields).encode()
     req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'telegram-checkin'})
     proxies = urllib.request.getproxies()
-    has_socks_only = any(str(v).lower().startswith('socks') for v in proxies.values()) and not any(
-        str(proxies.get(k, '')).lower().startswith(('http://', 'https://')) for k in ('https', 'http')
-    )
+    has_http_proxy = any(str(proxies.get(k, '')).lower().startswith(('http://', 'https://')) for k in ('https', 'http'))
+    has_socks_only = any(str(v).lower().startswith('socks') for v in proxies.values()) and not has_http_proxy
     try:
         if has_socks_only:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             cm = opener.open(req, timeout=15)
         else:
-            cm = urllib.request.urlopen(req, timeout=15)
+            try:
+                cm = urllib.request.urlopen(req, timeout=15)
+            except (ssl.SSLError, urllib.error.URLError) as proxy_err:
+                cause = getattr(proxy_err, 'reason', proxy_err)
+                if has_http_proxy and isinstance(cause, (ssl.SSLError, ConnectionRefusedError)):
+                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                    cm = opener.open(req, timeout=15)
+                else:
+                    raise
         with cm as response:
             data = json.loads(response.read(65536))
         if not isinstance(data, dict) or type(data.get('code')) is not int or data['code'] != 0:
