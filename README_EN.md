@@ -11,7 +11,7 @@
   <p>No API ID or API Hash required — includes a local web console, daily scheduler, read-only evidence recheck, lossless draft recovery, and WeChat (ServerChan) summaries.</p>
 
   <p>
-    <a href="#installation"><strong>Download v1.3.5</strong></a> ·
+    <a href="#installation"><strong>Download v1.3.6</strong></a> ·
     <a href="#key-features">Key Features</a> ·
     <a href="#screenshots">Screenshots</a> ·
     <a href="#quick-start">Quick Start</a> ·

@@ -1858,6 +1858,7 @@ class WebEngine:
                 relations[mid] = relation
                 found.append(effective_text)
                 source = "button_popup" if edited_button else ("reply_to_sent" if exact else "mention_self" if mentioned_self else "private_chat" if private else "unrelated")
+                record = {k: v for k, v in record.items() if k != "btns"}
                 record = {**record, "t": effective_text, "source": source}
                 evidence.append(record)
                 if exact or mentioned_self or private or edited_button:

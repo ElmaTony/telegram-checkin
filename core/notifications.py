@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -94,6 +95,15 @@ def _error_kind(error):
     return type(cause).__name__
 
 
+def _is_pre_http_handshake_error(error, *, has_http_proxy=False):
+    cause = getattr(error, 'reason', error)
+    if isinstance(cause, ssl.SSLError):
+        return True
+    if isinstance(cause, (TimeoutError, socket.timeout)) and 'handshake' in str(cause).lower():
+        return True
+    return bool(has_http_proxy and isinstance(cause, ConnectionRefusedError))
+
+
 def _post(key, title, description, *, short=''):
     validate_key(key)
     match = re.fullmatch(r'sctp(\d+)t[A-Za-z0-9]+', key)
@@ -110,15 +120,25 @@ def _post(key, title, description, *, short=''):
     try:
         if has_socks_only:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            cm = opener.open(req, timeout=15)
+            try:
+                cm = opener.open(req, timeout=10)
+            except (ssl.SSLError, TimeoutError, socket.timeout, urllib.error.URLError) as err:
+                if _is_pre_http_handshake_error(err):
+                    time.sleep(0.4)
+                    cm = opener.open(req, timeout=10)
+                else:
+                    raise
         else:
             try:
-                cm = urllib.request.urlopen(req, timeout=15)
-            except (ssl.SSLError, urllib.error.URLError) as proxy_err:
-                cause = getattr(proxy_err, 'reason', proxy_err)
-                if has_http_proxy and isinstance(cause, (ssl.SSLError, ConnectionRefusedError)):
-                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                    cm = opener.open(req, timeout=15)
+                cm = urllib.request.urlopen(req, timeout=10)
+            except (ssl.SSLError, TimeoutError, socket.timeout, urllib.error.URLError) as err:
+                if _is_pre_http_handshake_error(err, has_http_proxy=has_http_proxy):
+                    if has_http_proxy:
+                        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                        cm = opener.open(req, timeout=10)
+                    else:
+                        time.sleep(0.4)
+                        cm = urllib.request.urlopen(req, timeout=10)
                 else:
                     raise
         with cm as response:

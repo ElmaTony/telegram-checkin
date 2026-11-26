@@ -170,9 +170,11 @@ async def _wait_until(deadline):
         await asyncio.sleep(remaining)
 
 
-async def _watch_feedback(engine, boundary, group, cfg, *, sent_mids, started_at=None, min_wait=0.0, **extra):
+async def _watch_feedback(engine, boundary, group, cfg, *, sent_mids, started_at=None, min_wait=0.0, max_wait=None, **extra):
     configured_wait = float(cfg.get('reply_wait_seconds', 6))
     wait_seconds = max(configured_wait, min_wait) if configured_wait >= 1.0 else configured_wait
+    if max_wait is not None:
+        wait_seconds = min(wait_seconds, float(max_wait))
     return await engine.watch_new_incoming(
         boundary, wait_seconds,
         group.get('reply_mode') or cfg.get('reply_mode') or 'reply_only',
@@ -419,7 +421,7 @@ async def _recheck(engine, group, result, cfg):
         if not action.get('sent_mids') and not str((action.get('boundary') or {}).get('peer', '')).isdigit():
             continue
         engine.last_sent_mids.update(action['sent_mids'])
-        replies = await _watch_feedback(engine, action['boundary'], group, cfg, sent_mids=action['sent_mids'])
+        replies = await _watch_feedback(engine, action['boundary'], group, cfg, sent_mids=action['sent_mids'], max_wait=1.5)
         action['sent_mids'] = getattr(engine, 'last_allowed_mids', action['sent_mids'])
         action['replies'] = list(dict.fromkeys([*action.get('replies', []), *replies]))
         action['trusted_replies'] = list(dict.fromkeys([*action.get('trusted_replies', []), *engine.last_replied]))

@@ -269,11 +269,17 @@ def favicon():
 
 _STATUS_ACTION_KEYS = ('method', 'confirm', 'sent', 'clicked', 'buttons_complete',
                        'button_mid', 'sent_mids', 'confirmed_by_reply', 'error', 'warning')
+_STATUS_EVIDENCE_KEYS = ('mid', 't', 'source', 'rm')
 
 
 def _slim_actions(actions):
     return [{k: a[k] for k in _STATUS_ACTION_KEYS if k in a}
             for a in (actions or []) if isinstance(a, dict)]
+
+
+def _slim_evidence(items):
+    return [{k: item[k] for k in _STATUS_EVIDENCE_KEYS if k in item}
+            for item in (items or []) if isinstance(item, dict)]
 
 
 @app.get('/api/status')
@@ -299,7 +305,8 @@ def api_status():
             candidates=[item for item in latest.get('evidence',[]) if item.get('source')=='unrelated'
                         and any(word in item.get('t','') for word in ('签到','打卡','积分'))
                         and judge_replies({},cfg,[item.get('t','')])!='unconfirmed']
-            groups.append({**latest, 'actions': _slim_actions(latest.get('actions')), 'chat': chat,
+            groups.append({**latest, 'actions': _slim_actions(latest.get('actions')),
+                           'evidence': _slim_evidence(latest.get('evidence')), 'chat': chat,
                            'candidate_replies': candidates, 'feedback_hint': feedback_hint(group, cfg, latest),
                            'name': group.get('title') or state.get('_titles', {}).get(chat) or chat,
                            'method': infer_method(actions[0]), 'methods': [infer_method(action) for action in actions], 'action_count': len(actions),

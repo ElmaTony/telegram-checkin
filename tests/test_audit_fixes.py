@@ -112,6 +112,23 @@ class AuditFixUnitTests(unittest.TestCase):
         self.assertTrue(fallback_res['ok'])
         self.assertEqual(fake_opener.calls, 1)
 
+        # Direct pre-HTTP TLS handshake timeout retries once; post-connect read timeout does not retry
+        with patch.object(notifications.urllib.request, 'getproxies', return_value={}), \
+             patch.object(notifications.time, 'sleep'), \
+             patch.object(notifications.urllib.request, 'urlopen', side_effect=[
+                 urllib.error.URLError(TimeoutError('_ssl.c:993: The handshake operation timed out')),
+                 DirectOK(),
+             ]) as mock_open:
+            retry_res = notifications._post(KEY, '标题', '正文')
+        self.assertTrue(retry_res['ok'])
+        self.assertEqual(mock_open.call_count, 2)
+
+        with patch.object(notifications.urllib.request, 'getproxies', return_value={}), \
+             patch.object(notifications.urllib.request, 'urlopen', side_effect=TimeoutError('read timed out')) as mock_no_retry:
+            no_retry_res = notifications._post(KEY, '标题', '正文')
+        self.assertFalse(no_retry_res['ok'])
+        self.assertEqual(mock_no_retry.call_count, 1)
+
     def test_resolve_proxy_supports_direct_and_authenticated_url(self):
         self.assertIsNone(web_engine.resolve_proxy({'web_proxy': 'direct'}))
         self.assertIsNone(web_engine.resolve_proxy({'web_proxy': 'NONE'}))
@@ -260,6 +277,8 @@ class AuditFixGuiTests(unittest.TestCase):
                         'date': today,
                         'confirm': 'unconfirmed',
                         'sent': True,
+                        'replies': ['duplicate reply'],
+                        'evidence': [{'mid': '1002', 't': 'duplicate evidence', 'source': 'reply_to_sent', 'rm': '1001', 'btns': ['A'], 'out': False, 'peer': '-101'}],
                         'actions': [{
                             'method': 'text',
                             'sent': True,
@@ -281,6 +300,7 @@ class AuditFixGuiTests(unittest.TestCase):
         status = resp.json
         group = status['accounts'][0]['groups'][0]
         self.assertTrue(group['can_recheck'])
+        self.assertEqual(group['evidence'], [{'mid': '1002', 't': 'duplicate evidence', 'source': 'reply_to_sent', 'rm': '1001'}])
         action = group['actions'][0]
         self.assertNotIn('boundary', action)
         self.assertNotIn('replies', action)
@@ -409,6 +429,19 @@ class AuditFixGuiTests(unittest.TestCase):
         self.assertTrue(eng2.watch_kwargs[0]['check_popup'])
         self.assertEqual(eng2.watch_kwargs[0]['watch_button_mid'], '40')
         self.assertEqual(acts_cmd[0]['sent_mids'], ['10'])
+
+        # Recheck caps live tail wait to 1.5s after collecting historical messages
+        recheck_waits = []
+        class RecheckEngine(ButtonFakeEngine):
+            async def _scroll_chat_bottom(self): pass
+            async def collect_feedback_history(self, boundary): return {'items': [], 'aliases': []}
+            async def watch_new_incoming(self, known, seconds, *args, **kwargs):
+                recheck_waits.append(seconds)
+                return []
+        eng3 = RecheckEngine()
+        prev = {'actions': [{'ok': True, 'clicked': False, 'with_image': False, 'error': None, 'confirm': 'unconfirmed', 'sent': True, 'sent_mids': ['10'], 'boundary': {'peer': '-101', 'cutoff': 1.0}}]}
+        asyncio.run(runner._recheck(eng3, {'chat': '-101'}, prev, {'reply_wait_seconds': 6}))
+        self.assertEqual(recheck_waits, [1.5])
 
 
 if __name__ == '__main__':
