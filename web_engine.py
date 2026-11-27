@@ -1816,7 +1816,7 @@ class WebEngine:
                     evidence.append(rec)
                     break
             remaining = deadline - time.monotonic()
-            remaining = remaining if remaining > 0 else .1
+            remaining = remaining if remaining > 0 else .25
             try:
                 data = await asyncio.wait_for(self.page.evaluate(self._IN_COLLECT_JS, {"peer": known["peer"], "reset": False}), timeout=remaining)
             except asyncio.TimeoutError:
