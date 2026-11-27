@@ -11,7 +11,7 @@
   <p>无需申请 API ID / API Hash，支持桌面端与 Linux 云端常驻，内置每日定时调度、只读证据补查、草稿无损恢复与微信汇总推送。</p>
 
   <p>
-    <a href="#下载安装"><strong>下载 v1.3.6</strong></a> ·
+    <a href="#下载安装"><strong>下载 v1.3.7</strong></a> ·
     <a href="#核心特性">核心特性</a> ·
     <a href="#界面预览">界面预览</a> ·
     <a href="#快速上手">快速上手</a> ·

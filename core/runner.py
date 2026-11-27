@@ -409,16 +409,18 @@ async def _recheck(engine, group, result, cfg):
             if str(old) in ids:
                 ids.add(str(new))
         action['sent_mids'] = sorted(ids)
-        if not action.get('sent_mids'):
+        has_server_mid = any('.' not in str(m) for m in (action.get('sent_mids') or []))
+        if not has_server_mid:
             text = action.get('sent_text')
             if text is None and index < len(configured):
                 candidate = configured[index].get('message')
                 text = candidate if isinstance(candidate, str) else None
             recovered = await engine.recover_sent_mids(action['boundary'], text)
-            action['sent_mids'] = recovered['sent_mids']
             if recovered['sent_mids']:
+                action['sent_mids'] = sorted(set(action.get('sent_mids') or []) | set(recovered['sent_mids']))
                 action['id_recovery'] = recovered
-        if not action.get('sent_mids') and not str((action.get('boundary') or {}).get('peer', '')).isdigit():
+                has_server_mid = any('.' not in str(m) for m in action['sent_mids'])
+        if not has_server_mid and not str((action.get('boundary') or {}).get('peer', '')).isdigit():
             continue
         engine.last_sent_mids.update(action['sent_mids'])
         replies = await _watch_feedback(engine, action['boundary'], group, cfg, sent_mids=action['sent_mids'], max_wait=1.5)

@@ -437,11 +437,39 @@ class AuditFixGuiTests(unittest.TestCase):
             async def collect_feedback_history(self, boundary): return {'items': [], 'aliases': []}
             async def watch_new_incoming(self, known, seconds, *args, **kwargs):
                 recheck_waits.append(seconds)
+                self.last_allowed_mids = sorted(kwargs.get('sent_mids') or [])
                 return []
         eng3 = RecheckEngine()
         prev = {'actions': [{'ok': True, 'clicked': False, 'with_image': False, 'error': None, 'confirm': 'unconfirmed', 'sent': True, 'sent_mids': ['10'], 'boundary': {'peer': '-101', 'cutoff': 1.0}}]}
         asyncio.run(runner._recheck(eng3, {'chat': '-101'}, prev, {'reply_wait_seconds': 6}))
         self.assertEqual(recheck_waits, [1.5])
+
+        # Temporary-only sent_mids triggers recover_sent_mids during _recheck and missing_message_id hint
+        temp_res = {'confirm': 'unconfirmed', 'actions': [{'ok': True, 'clicked': False, 'with_image': False, 'error': None, 'confirm': 'unconfirmed', 'sent': True, 'sent_mids': ['100.0001'], 'boundary': {'peer': '-101', 'cutoff': 1.0}}]}
+        self.assertEqual(logic.feedback_hint({}, {}, temp_res)['code'], 'missing_message_id')
+
+        class TempRecoverEngine(RecheckEngine):
+            def __init__(self):
+                super().__init__()
+                self.recover_calls = 0
+            async def recover_sent_mids(self, boundary, text=None):
+                self.recover_calls += 1
+                return {'sent_mids': ['501'], 'evidence': [], 'source': 'own_outgoing_history'}
+        eng4 = TempRecoverEngine()
+        rechecked = asyncio.run(runner._recheck(eng4, {'chat': '-101', 'message': '签到'}, temp_res, {'reply_wait_seconds': 6}))
+        self.assertEqual(eng4.recover_calls, 1)
+        self.assertIn('501', rechecked['actions'][0]['sent_mids'])
+
+        # /api/status caps unrelated evidence items and truncates long spam text
+        long_spam = '广' * 500
+        slimmed = gui._slim_evidence([
+            {'mid': '1', 't': '签到成功', 'source': 'reply_to_sent', 'rm': '10'},
+            *[{'mid': str(i + 2), 't': long_spam, 'source': 'unrelated', 'rm': None} for i in range(15)],
+        ])
+        self.assertEqual(len(slimmed), 13)
+        self.assertEqual(slimmed[0]['t'], '签到成功')
+        self.assertLessEqual(len(slimmed[-1]['t']), 300)
+        self.assertTrue(slimmed[-1]['t'].endswith('…'))
 
 
 if __name__ == '__main__':

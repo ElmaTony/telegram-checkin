@@ -278,8 +278,18 @@ def _slim_actions(actions):
 
 
 def _slim_evidence(items):
-    return [{k: item[k] for k in _STATUS_EVIDENCE_KEYS if k in item}
-            for item in (items or []) if isinstance(item, dict)]
+    trusted, unrelated = [], []
+    for item in (items or []):
+        if not isinstance(item, dict):
+            continue
+        slim = {k: item[k] for k in _STATUS_EVIDENCE_KEYS if k in item}
+        is_unrelated = slim.get('source') == 'unrelated'
+        if isinstance(slim.get('t'), str):
+            limit = 300 if is_unrelated else 1200
+            if len(slim['t']) > limit:
+                slim['t'] = slim['t'][:limit - 1] + '…'
+        (unrelated if is_unrelated else trusted).append(slim)
+    return [*trusted, *unrelated[-12:]]
 
 
 @app.get('/api/status')

@@ -1234,5 +1234,53 @@ class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started, 3.0)
         self.assertIn('300', boundary['seen'])
 
+    async def test_scroll_chat_bottom_waits_for_go_down_when_sidebar_shows_unread_badge(self):
+        self.engine._expected_peer = '-101'
+        await self.page.set_content('''
+          <div class="chatlist-container">
+            <a class="chatlist-chat" data-peer-id="-101">
+              <span class="dialog-subtitle-badge-unread unread" id="badge">50</span>
+            </a>
+          </div>
+          <div class="chat tabs-tab active">
+            <div class="chat-info"><span class="peer-title" data-peer-id="-101">BusyGroup</span></div>
+            <div class="bubbles"><div class="bubbles-scrollable" style="height:200px;overflow:auto"><div class="bubbles-inner">
+              <div class="bubble is-in" data-mid="100" data-peer-id="-101" data-timestamp="1700000000"><div class="message">stale cached</div></div>
+            </div></div></div>
+          </div>
+          <script>
+            setTimeout(() => {
+              const chat = document.querySelector('.chat.active');
+              chat.classList.add('is-go-down-visible');
+              const btn = document.createElement('button');
+              btn.className = 'bubbles-go-down';
+              btn.style.cssText = 'width:40px;height:40px';
+              btn.textContent = '50';
+              btn.onclick = () => {
+                document.querySelector('#badge').remove();
+                chat.classList.remove('is-go-down-visible');
+                btn.remove();
+                chat.querySelector('.bubbles-inner').innerHTML =
+                  '<div class="bubble is-in" data-mid="9000" data-peer-id="-101" data-timestamp="' + Math.floor(Date.now()/1000) + '"><div class="message">latest</div></div>';
+              };
+              chat.append(btn);
+            }, 300);
+          </script>
+        ''')
+        boundary = await self.engine.snapshot_incoming()
+        self.assertIn('9000', boundary['seen'])
+        self.assertNotIn('100', boundary['seen'])
+
+    async def test_watch_new_incoming_recovers_server_mid_when_only_temporary_mid_present(self):
+        self.engine._expected_peer = self.engine._mids_chat = '-101'
+        self.engine._automation_text = '签到'
+        now = int(time.time())
+        known = {'peer': '-101', 'cutoff': now - 2, 'sent_at': now - 2, 'seen': []}
+        await self.bubble('501', '签到', out=True)
+        await self.bubble('502', '签到成功', reply='501')
+        await self.engine.watch_new_incoming(known, 0.3, 'reply_only', idle_after=0.05, sent_mids=['100.0001'])
+        self.assertEqual(self.engine.last_replied, ['签到成功'])
+        self.assertIn('501', self.engine.last_allowed_mids)
+
 
 if __name__=='__main__': unittest.main()

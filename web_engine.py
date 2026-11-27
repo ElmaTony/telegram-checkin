@@ -1583,7 +1583,12 @@ class WebEngine:
                 }
             }
         }
-        return {ready:!!bubble||empty,has_jump:pending,clickable:!!button,scrolled,initial_loading};
+        const unread=[...document.querySelectorAll('.chatlist-chat[data-peer-id]')].some(row=>{
+            if(row.dataset.peerId!==peer||!row.checkVisibility())return false;
+            const badge=row.querySelector('.dialog-subtitle-badge-unread, .unread');
+            return !!(badge&&visible(badge)&&/\d/.test(badge.textContent||''));
+        });
+        return {ready:!!bubble||empty,has_jump:pending,clickable:!!button,scrolled,initial_loading,has_unread:unread};
     }"""
 
     async def _scroll_chat_bottom(self):
@@ -1596,6 +1601,7 @@ class WebEngine:
             align=attempts>0 or (stuck_since is not None and current-stuck_since>=.4)
             state=await self.page.evaluate(self._LATEST_VIEW_JS,{'peer':str(self._expected_peer),'align':align})
             waiting_initial=state['initial_loading'] and (current-started)<.9
+            waiting_unread=bool(state.get('has_unread')) and attempts==0 and not state['has_jump'] and (current-started)<1.8
             if state['has_jump'] and not state['clickable'] and not waiting_initial:
                 stuck_since=stuck_since or current
             else:
@@ -1609,7 +1615,7 @@ class WebEngine:
                         try:await button.click(timeout=800)
                         except Exception:pass  # The navigation control can disappear during a valid jump.
                 finally:await handle.dispose()
-            if (state['ready'] or str(self._expected_peer).isdigit()) and not waiting_initial and not state['has_jump'] and not state['scrolled']:
+            if (state['ready'] or str(self._expected_peer).isdigit()) and not waiting_initial and not waiting_unread and not state['has_jump'] and not state['scrolled']:
                 settled=settled or current
                 if current-settled>=.15:
                     await self.assert_destination()
@@ -1820,7 +1826,8 @@ class WebEngine:
                     self.last_sent_mids.add(str(new))
                 if str(old) in allowed:
                     allowed.add(str(new))
-            if not allowed and known.get('sent_at') and not known.get('button_only'):
+            has_server_mid = any('.' not in str(m) for m in allowed)
+            if not has_server_mid and known.get('sent_at') and not known.get('button_only'):
                 recovered = await self.recover_sent_mids(known, self._automation_text)
                 allowed.update(recovered['sent_mids'])
                 self.last_sent_mids.update(allowed)

@@ -238,9 +238,11 @@ def feedback_hint(group, cfg, result):
         if action.get('buttons_complete') is False:
             return {'code':'buttons_pending', 'message':'必需按钮尚未完成。请先核对原消息，避免重复发送口令。'}
     for action in pending:
-        if action.get('sent') is not False and not action.get('sent_mids'):
-            message = ('尚未登记消息 ID，可先只读补查历史反馈；不会重新发送签到内容。'
-                       if recheck_eligible(result) else '发送状态待核对，尚未登记消息 ID。请先在 Telegram 检查，避免重复发送。')
+        sent_mids = action.get('sent_mids') or []
+        has_server_mid = any('.' not in str(m) for m in sent_mids)
+        if action.get('sent') is not False and not has_server_mid and not action.get('confirmed_by_reply'):
+            message = ('尚未登记正式消息 ID，可先只读补查历史反馈；不会重新发送签到内容。'
+                       if recheck_eligible(result) else '发送状态待核对，尚未登记正式消息 ID。请先在 Telegram 检查，避免重复发送。')
             return {'code':'missing_message_id', 'message':message}
     for action in pending:
         trusted = action.get('trusted_replies') or []
