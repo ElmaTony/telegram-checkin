@@ -268,7 +268,7 @@ def favicon():
 
 
 _STATUS_ACTION_KEYS = ('method', 'confirm', 'sent', 'clicked', 'buttons_complete',
-                       'button_mid', 'sent_mids', 'confirmed_by_reply', 'error', 'warning')
+                       'button_only', 'button_mid', 'sent_mids', 'confirmed_by_reply', 'error', 'warning')
 _STATUS_EVIDENCE_KEYS = ('mid', 't', 'source', 'rm')
 
 
@@ -419,6 +419,29 @@ def api_config_get():
     rev = revision(cfg)
     public_cfg = {k: v for k, v in cfg.items() if k != 'gui_token'}
     return jsonify(**public_cfg, _revision=rev)
+
+
+@app.post('/api/config/parse')
+def api_config_parse():
+    data = body()
+    text = data.get('text')
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError('请提供非空的 JSON 或 YAML 配置内容')
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError as error:
+        raise ValueError(f'配置格式无法解析：{error}') from error
+    if not isinstance(parsed, dict) or not isinstance(parsed.get('accounts'), list):
+        raise ValueError('配置文件必须为对象且包含 accounts 数组')
+    parsed.pop('gui_token', None)
+    error = validate_config(parsed)
+    if error:
+        raise ValueError(error)
+    try:
+        json.dumps(parsed, ensure_ascii=False)
+    except TypeError as error:
+        raise ValueError('配置包含不支持的数据类型，请检查日期或特殊标签') from error
+    return jsonify(ok=True, cfg=parsed)
 
 
 def _verify_revision(data, current):
@@ -852,8 +875,9 @@ def api_judge():
     return jsonify(ok=True, confirm=confirm, hits=hits, note='仅测试话术匹配，不验证消息归属，也不发送消息')
 
 
-def _history_rows():
+def _history_rows(collect_accounts=False):
     rows = []
+    accounts = set()
     for path in sorted(HISTORY_DIR.glob('*.csv'), reverse=True):
         with path.open(encoding='utf-8-sig', newline='') as stream:
             reader = csv.reader(stream)
@@ -861,6 +885,8 @@ def _history_rows():
             for row in reader:
                 if len(row) < 5:
                     continue
+                if collect_accounts and row[1]:
+                    accounts.add(row[1])
                 item = dict(zip(('time', 'account', 'group', 'status', 'detail'), row[:5]))
                 if request.args.get('account') and item['account'] != request.args['account']:
                     continue
@@ -873,7 +899,8 @@ def _history_rows():
                 if request.args.get('to') and item['time'][:10] > request.args['to']:
                     continue
                 rows.append(item)
-    return sorted(rows, key=lambda row: row['time'], reverse=True)
+    ordered = sorted(rows, key=lambda row: row['time'], reverse=True)
+    return (ordered, sorted(accounts)) if collect_accounts else ordered
 
 
 def _parse_int_arg(name, default, lo, hi):
@@ -891,9 +918,9 @@ def _parse_int_arg(name, default, lo, hi):
 def api_history():
     page = _parse_int_arg('page', 1, 1, 100000)
     limit = _parse_int_arg('limit', 100, 1, 1000)
-    rows = _history_rows()
+    rows, accounts = _history_rows(collect_accounts=True)
     counts = Counter(row['status'] for row in rows)
-    return jsonify(ok=True, rows=rows[(page-1)*limit:page*limit], total=len(rows), counts=counts, page=page, limit=limit)
+    return jsonify(ok=True, rows=rows[(page-1)*limit:page*limit], total=len(rows), counts=counts, accounts=accounts, page=page, limit=limit)
 
 
 @app.get('/api/history/download')
@@ -936,10 +963,21 @@ def api_logs():
         raise ValueError('日志级别无效')
     lines = deque(maxlen=500)
     if LOG_PATH.exists():
-        with LOG_PATH.open(encoding='utf-8', errors='replace') as stream:
-            for line in stream:
-                if (not level or f'[{level}]' in line) and query in line.lower():
-                    lines.append(line)
+        if not level and not query and LOG_PATH.stat().st_size > 262144:
+            with LOG_PATH.open('rb') as stream:
+                size = stream.seek(0, os.SEEK_END)
+                offset = max(0, size - 262144)
+                stream.seek(offset)
+                chunk = stream.read().decode('utf-8', errors='replace')
+            split_lines = chunk.splitlines(keepends=True)
+            if offset > 0 and split_lines:
+                split_lines = split_lines[1:]
+            lines.extend(split_lines)
+        else:
+            with LOG_PATH.open(encoding='utf-8', errors='replace') as stream:
+                for line in stream:
+                    if (not level or f'[{level}]' in line) and query in line.lower():
+                        lines.append(line)
     return jsonify(ok=True, text=''.join(lines))
 
 

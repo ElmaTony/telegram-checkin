@@ -11,7 +11,7 @@
   <p>No API ID or API Hash required — includes a local web console, daily scheduler, read-only evidence recheck, lossless draft recovery, and WeChat (ServerChan) summaries.</p>
 
   <p>
-    <a href="#installation"><strong>Download v1.3.7</strong></a> ·
+    <a href="#installation"><strong>Download v1.3.8</strong></a> ·
     <a href="#key-features">Key Features</a> ·
     <a href="#screenshots">Screenshots</a> ·
     <a href="#quick-start">Quick Start</a> ·
@@ -45,7 +45,7 @@
 | **Evidence-Based Anti-Resend** | Monitors bot replies, modal popups, non-modal toasts, and inline button edits to distinguish **Success**, **Unconfirmed**, and **Failed**. Already-sent or uncertain targets use read-only recheck before any resend. |
 | **Lossless Draft Preservation** | Backs up and clears existing Telegram drafts before sending, then restores them to the exact account, chat, and topic on completion, failure, or cancellation; keeps a local backup with a warning if safe restoration cannot be verified. |
 | **Daily Scheduler & WeChat Summary** | Runs an independent daily schedule in any IANA timezone (with custom time picker, searchable 400+ IANA timezone picker, account scoping, headless execution, and same-day catch-up), sending a consolidated **ServerChan** summary when each round finishes. |
-| **Modern Light & Night Workbench** | Built-in Telegram Sky light and night palette with run preview, live stage progress, date-grouped history, statistics, and runtime log viewer. |
+| **Modern Light & Night Workbench** | Built-in Telegram Sky light and night palette with run preview, live stage progress, validated config import/export, date-grouped history, drill-down statistics, and auto-following log viewer. |
 
 ---
 

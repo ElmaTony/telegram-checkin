@@ -35,13 +35,14 @@ async def main():
     data={**data,'settings':body['schedule'],'notifications':body['notifications'],'revision':data['revision']+'x','next_run':'2026-11-05T00:10:00+08:00'}
     cfg.update(schedule=copy.deepcopy(body['schedule']),notifications=copy.deepcopy(body['notifications']))
     if body.get('sendkey'):data['key']={'configured':True,'source':'local','error':''}
+    if body.get('clear_sendkey'):data['key']={'configured':False,'source':'','error':''}
     return await route.fulfill(json=data)
    if path=='/api/notifications/test':
     data['notification']={'time':'2026-11-04T10:00:00+08:00','ok':True,'message':'Server酱已接受，微信送达请以接收端为准'}
     return await route.fulfill(json=data['notification'])
   raise AssertionError('Unexpected API: '+path)
  async with async_playwright() as p:
-  browser=await p.chromium.launch(**({'channel':'msedge'} if sys.platform=='win32' else {}),headless=True)
+  browser=await p.chromium.launch(**({} if Path(p.chromium.executable_path).is_file() else ({'channel':'msedge'} if sys.platform=='win32' else {})),headless=True)
   page=await browser.new_page(viewport={'width':1440,'height':1000})
   page.on('pageerror',lambda error:errors.append(str(error)))
   await page.route('**/api/**',intercept)
@@ -93,6 +94,11 @@ async def main():
   assert await page.locator('[data-account-name="0"]').input_value()=='A draft'
   await page.get_by_role('button',name='定时与通知',exact=True).click()
   assert not any(row['path'] in ('/api/checkin_now','/api/probe','/api/recheck') for row in posts)
+  await page.get_by_role('button',name='清除密钥',exact=True).click()
+  assert not await page.locator('[data-notification="enabled"]').is_checked()
+  await page.get_by_role('button',name='保存设置',exact=True).click()
+  await page.get_by_text('尚未配置密钥',exact=True).wait_for()
+  assert posts[-1]['body'].get('clear_sendkey') is True
   await page.evaluate('document.querySelector("#notifications").replaceChildren()')
   await page.screenshot(path=str(OUT/'automation-desktop.png'))
   for width in (1024,390,320):

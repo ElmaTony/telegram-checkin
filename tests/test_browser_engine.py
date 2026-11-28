@@ -38,11 +38,58 @@ class NavigationRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.page.goto.await_count,3)
 
 
-class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
+class _SharedChromiumTestCase(unittest.TestCase):
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        for name, attr in list(cls.__dict__.items()):
+            if name.startswith('test_') and asyncio.iscoroutinefunction(attr):
+                def _wrap(coro_fn):
+                    def _sync(self):
+                        return self._run_browser_test(coro_fn(self))
+                    return _sync
+                setattr(cls, name, _wrap(attr))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._runner = asyncio.Runner()
+        async def _boot():
+            pw = await async_playwright().start()
+            launch_opts = {'headless': True}
+            if not Path(pw.chromium.executable_path).is_file() and sys.platform == 'win32':
+                launch_opts['channel'] = 'msedge'
+            browser = await pw.chromium.launch(**launch_opts)
+            return pw, browser
+        cls._pw, cls._browser = cls._runner.run(_boot())
+
+    @classmethod
+    def tearDownClass(cls):
+        async def _stop():
+            try:
+                await cls._browser.close()
+            finally:
+                await cls._pw.stop()
+        try:
+            cls._runner.run(_stop())
+        finally:
+            cls._runner.close()
+
+    def _run_browser_test(self, coro):
+        async def _execute():
+            self.context = await self._browser.new_context()
+            self.page = await self.context.new_page()
+            try:
+                await self.asyncSetUp()
+                try:
+                    return await coro
+                finally:
+                    await self.asyncTearDown()
+            finally:
+                await self.context.close()
+        return self._runner.run(_execute())
+
+
+class EngineDOMTests(_SharedChromiumTestCase):
     async def asyncSetUp(self):
-        self.pw=await async_playwright().start()
-        self.browser=await self.pw.chromium.launch(**({'channel':'msedge'} if sys.platform=='win32' else {}),headless=True)
-        self.page=await self.browser.new_page()
         await self.page.set_content('''<div class="chat-info"><span class="peer-title" data-peer-id="-101">Target</span></div>
             <div contenteditable="true" class="input-message-input" data-peer-id="-101"></div><div class="bubbles"><div class="bubbles-inner no-messages"></div></div>''')
         self.engine=WebEngine({'name':'Fixture'}, {})
@@ -53,8 +100,6 @@ class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
         self.engine.profile=Path(self.draft_directory.name)
 
     async def asyncTearDown(self):
-        await self.browser.close()
-        await self.pw.stop()
         self.draft_directory.cleanup()
 
     async def test_dialog_scan_waits_for_active_list_after_login(self):
@@ -1281,6 +1326,45 @@ class EngineDOMTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.watch_new_incoming(known, 0.3, 'reply_only', idle_after=0.05, sent_mids=['100.0001'])
         self.assertEqual(self.engine.last_replied, ['签到成功'])
         self.assertIn('501', self.engine.last_allowed_mids)
+
+    async def test_collect_feedback_history_targets_active_peer_scroller_and_mention_variants(self):
+        self.engine._expected_peer = '-101'
+        self.engine._mids_chat = '-101'
+        self.engine._self_peer = '555001'
+        cutoff = time.time() - 600
+        await self.page.set_content('''
+          <div class="chat tabs-tab">
+            <div class="chat-info" style="display:none"><span class="peer-title" data-peer-id="-999">Other</span></div>
+            <div class="bubbles"><div class="bubbles-scrollable" style="height:80px;overflow:auto"><div style="height:500px"></div></div></div>
+          </div>
+          <div class="chat tabs-tab active" id="target-chat">
+            <div class="chat-info"><span class="peer-title" data-peer-id="-101">Target</span></div>
+            <div class="bubbles"><div class="bubbles-scrollable" id="target-sc" style="height:80px;overflow:auto"><div style="height:500px"></div></div></div>
+          </div>
+        ''')
+        await self.page.evaluate('''cutoff => {
+            const sc = document.querySelector('#target-sc');
+            sc.scrollTop = 300;
+            const latest = document.createElement('div');
+            latest.className = 'bubble is-in';
+            Object.assign(latest.dataset, {mid: '900', peerId: '-101', timestamp: String(Math.floor(Date.now()/1000))});
+            latest.innerHTML = '<div class="message"><div data-message-text-source><a class="mention" data-peer-id="555001">Me</a> 签到成功</div></div>';
+            sc.append(latest);
+            sc.addEventListener('scroll', () => {
+                if (window.loadedTargetHistory) return;
+                window.loadedTargetHistory = true;
+                const old = document.createElement('div');
+                old.className = 'bubble is-in';
+                Object.assign(old.dataset, {mid: '499', peerId: '-101', timestamp: String(Math.floor(cutoff - 10))});
+                old.innerHTML = '<div class="message"><div data-message-text-source><a href="tg://user?id=555001">Me</a> older</div></div>';
+                sc.append(old);
+            });
+        }''', cutoff)
+        res = await self.engine.collect_feedback_history({'peer': '-101', 'cutoff': cutoff}, seconds=1)
+        by_mid = {item['mid']: item for item in res['items']}
+        self.assertIn('499', by_mid)
+        self.assertEqual(by_mid['900']['mentions'], ['555001'])
+        self.assertEqual(by_mid['499']['mentions'], ['555001'])
 
 
 if __name__=='__main__': unittest.main()

@@ -84,7 +84,7 @@ async def main():
   await page.wait_for_function("document.querySelector('#job-banner').hidden")
 
  async with async_playwright() as pw:
-  browser=await pw.chromium.launch(**({'channel':'msedge'} if sys.platform=='win32' else {}),headless=True)
+  browser=await pw.chromium.launch(**({} if Path(pw.chromium.executable_path).is_file() else ({'channel':'msedge'} if sys.platform=='win32' else {})),headless=True)
   page=await browser.new_page(viewport={'width':1440,'height':1050})
   page.on('pageerror',lambda e:errors.append(str(e)))
   await page.route('**/api/**',intercept)
@@ -145,6 +145,13 @@ async def main():
   assert await page.get_by_role('spinbutton',name='账号间隔最小值').input_value()=='2'
   assert await page.get_by_role('spinbutton',name='账号间隔最大值').input_value()=='2'
   await page.get_by_role('spinbutton',name='反馈窗口上限（秒）').fill('23')
+  assert await page.locator('.save-bar.is-dirty').count()==1
+  assert await page.locator('#nav-accounts .nav-dirty-dot').count()==1
+  await page.locator('#group-search').fill('摄影')
+  await page.get_by_role('checkbox',name='选择全部群',exact=True).check()
+  assert '已选 1 个会话' in await page.locator('.bulk-bar').inner_text()
+  await page.get_by_role('checkbox',name='选择全部群',exact=True).uncheck()
+  await page.locator('#group-search').fill('')
   await page.locator('.account-card').nth(1).click(position={'x':10,'y':9})
   assert await page.get_by_role('textbox',name='账号名称',exact=True).input_value()=='备用账号'
   assert await page.get_by_role('button',name='管理会话：备用账号').get_attribute('aria-pressed')=='true'
@@ -199,12 +206,9 @@ async def main():
   assert await page.locator('.plan-list').inner_text()=='工作账号 · 1 个目标\n英语角'
   await confirm_scoped_job(page,'工作账号',['-301'])
   await page.get_by_role('combobox',name='筛选账号',exact=True).select_option('工作账号')
-  before=len([p for p in posts if p['path']=='/api/checkin_now'])
-  await page.get_by_role('button',name='签到此账号',exact=True).click()
-  assert not await page.locator('#modal').is_visible()
-  assert len([p for p in posts if p['path']=='/api/checkin_now'])==before
+  assert await page.get_by_role('button',name='签到此账号',exact=True).is_disabled()
   await page.get_by_role('combobox',name='筛选账号',exact=True).select_option('')
-  await page.get_by_role('button',name='全部账号待签到',exact=True).click()
+  await page.get_by_role('button',name='签到全部待办',exact=True).click()
   assert await page.get_by_role('checkbox',name='显示签到过程',exact=False).is_checked()
   await click_api(page,page.get_by_role('button',name='确认发送',exact=True),'/api/checkin_now')
   assert [p for p in posts if p['path']=='/api/checkin_now'][-1]['body']['show_browser'] is True
@@ -231,9 +235,16 @@ async def main():
   await page.locator('.history-entry').first.wait_for()
   await page.get_by_role('button',name='统计',exact=True).click()
   await page.get_by_text('共 4 次记录',exact=False).wait_for()
+  assert await page.locator('.legend-dot').count()==3
+  await page.locator('.stats-row').first.click()
+  await page.get_by_role('heading',name='执行记录',exact=True).wait_for()
   await page.get_by_role('button',name='运行日志',exact=True).click()
   await page.get_by_text('本地测试日志',exact=False).wait_for()
   await page.get_by_role('button',name='签到工作台',exact=True).click()
+  await page.locator('.metric-failed').click()
+  assert await page.locator('.task-table tbody tr').count()==1
+  await page.locator('.metric-failed').click()
+  assert await page.locator('.task-table tbody tr').count()==6
   await page.evaluate('document.querySelector("#notifications").replaceChildren()')
   for width in [1024,736,390,320]:
    await page.set_viewport_size({'width':width,'height':1000})

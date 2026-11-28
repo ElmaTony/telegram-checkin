@@ -99,9 +99,15 @@ def _is_pre_http_handshake_error(error, *, has_http_proxy=False):
     cause = getattr(error, 'reason', error)
     if isinstance(cause, ssl.SSLError):
         return True
+    if 'tunnel connection failed' in str(cause).lower():
+        return True
     if isinstance(cause, (TimeoutError, socket.timeout)) and 'handshake' in str(cause).lower():
         return True
-    return bool(has_http_proxy and isinstance(cause, ConnectionRefusedError))
+    if has_http_proxy and isinstance(error, urllib.error.URLError) and isinstance(
+        cause, (TimeoutError, socket.timeout, ConnectionRefusedError, ConnectionResetError, socket.gaierror)
+    ):
+        return True
+    return False
 
 
 def _post(key, title, description, *, short=''):
@@ -182,7 +188,18 @@ def _reason(result, cfg):
     """Human-facing causes without raw exceptions, URLs, paths or bot chatter."""
     actions = result.get('actions') or []
     if result['confirm'] == 'unconfirmed':
-        uncertain = any(a.get('sent') and a.get('warning') and not a.get('sent_mids') for a in actions)
+        uncertain = result.get('sent') is None or any(
+            not a.get('button_only') and a.get('method') != 'button_only' and not a.get('confirmed_by_reply')
+            and (
+                a.get('sent') is None
+                or (
+                    a.get('sent')
+                    and not any('.' not in str(m) for m in (a.get('sent_mids') or []))
+                    and (a.get('warning') or a.get('sent_mids'))
+                )
+            )
+            for a in actions
+        )
         if uncertain or result.get('sent') is not True:
             return '发送状态待核对；请先查看 Telegram，勿直接重发。'
         candidate = result.get('candidate_replies') or any(

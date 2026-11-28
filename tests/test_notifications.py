@@ -69,6 +69,12 @@ class NotificationReportTests(unittest.TestCase):
         self.assertNotIn('## ✅ 已完成', body)
         self.assertIn('勿直接重发', body)
 
+        temp_only = copy.deepcopy(self.runtime)
+        temp_only['_last']['主号']['-103']['actions'] = [{'sent': True, 'sent_mids': ['100.0001']}]
+        _, temp_body, _ = notifications.round_message(self.cfg, temp_only, only='主号', chats=['-103'])
+        self.assertIn('发送状态待核对', temp_body)
+        self.assertNotIn('已发出；', temp_body)
+
     def test_candidate_feedback_is_not_promoted_to_success(self):
         before = copy.deepcopy(self.runtime)
         _, body, issues = notifications.round_message(self.cfg, self.runtime, only='备用号', chats=['-203'])

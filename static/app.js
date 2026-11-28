@@ -5,22 +5,39 @@ import {workbench} from './workbench.js';
 
 const main=document.querySelector('#main'),modal=document.querySelector('#modal'),chooser=document.querySelector('#chooser');
 const state={page:'overview',status:null,selected:null,query:'',accountFilter:'',filter:'all',focus:false,kindFilter:'',methodFilter:'',structureFilter:'',systemFilter:'',catalogOpen:false,
- cfg:null,draft:null,revision:null,dirty:false,origins:new WeakMap(),accountIndex:0,checkedGroups:new Set(),globalOpen:false,
- history:null,historyFilter:{q:'',account:'',status:'',from:'',to:''},historyPage:1,stats:null,statsDays:30,logs:null,logLevel:'',logQuery:'',editor:null,
- chooser:{dialogs:[],folders:[],checked:new Set(),query:'',folder:'',loading:false,error:''},pendingPlan:null,pendingDelete:null,
- automation:null,automationDraft:null,automationKey:'',automationScope:'all',automationDirty:false,testingNotification:false,
+ cfg:null,draft:null,revision:null,dirty:false,origins:new WeakMap(),accountIndex:0,checkedGroups:new Set(),globalOpen:false,groupQuery:'',
+ history:null,historyFilter:{q:'',account:'',status:'',from:'',to:''},historyPage:1,stats:null,statsDays:30,logs:null,logLevel:'',logQuery:'',logAutoFollow:true,editor:null,
+ chooser:{dialogs:[],folders:[],checked:new Set(),query:'',folder:'',loading:false,error:''},pendingPlan:null,pendingDelete:null,dismissedJobKey:null,
+ automation:null,automationDraft:null,automationKey:'',automationClearKey:false,prevNotifyEnabled:false,automationScope:'all',automationDirty:false,testingNotification:false,
  openPicker:null,tzQuery:'',tzShowAll:false};
 const reqSeq={status:0,history:0,stats:0,logs:0,nav:0};
 let composing=false;
 
 function syncExecutionButtons(){
- const busy=state.status?.busy,accounts=state.status?.accounts||[];
- main.querySelectorAll('[data-action="run-chat"],[data-action="run-account"],[data-action="run-account-filter"]').forEach(el=>{
+ const busy=state.status?.busy,accounts=state.status?.accounts||[],rows=flatten(state.status);
+ main.querySelectorAll('[data-action="run"],[data-action="run-chat"],[data-action="run-account"],[data-action="run-account-filter"]').forEach(el=>{
   let unavailable=busy||(state.page==='accounts'&&state.dirty);
-  if(el.dataset.action==='run-account-filter')unavailable||=!state.accountFilter;
+  if(el.dataset.action==='run')unavailable||=!rows.some(r=>!r.done&&r.confirm!=='success');
+  if(el.dataset.action==='run-account-filter')unavailable||=!state.accountFilter||!rows.some(r=>r.account===state.accountFilter&&!r.done&&r.confirm!=='success');
   if(el.dataset.action==='run-account')unavailable||=!accounts.some(a=>a.name===el.dataset.account);
   el.disabled=!!unavailable;
  });
+}
+function syncDraftIndicator(){
+ const el=document.querySelector('#draft-indicator');
+ if(el){
+  const hasDirty=Boolean(state.dirty||state.automationDirty);
+  el.hidden=!hasDirty;
+  if(state.dirty&&state.automationDirty)el.textContent='规则与定时有未保存修改 · 去保存';
+  else if(state.dirty)el.textContent='账号规则未保存 · 去保存';
+  else if(state.automationDirty)el.textContent='定时通知未保存 · 去保存';
+ }
+ for(const [id,isDirty] of [['#nav-accounts',state.dirty],['#nav-automation',state.automationDirty]]){
+  const navBtn=document.querySelector(id);if(!navBtn)continue;
+  const dot=navBtn.querySelector('.nav-dirty-dot');
+  if(isDirty&&!dot){const span=document.createElement('span');span.className='nav-dirty-dot';span.setAttribute('aria-hidden','true');navBtn.append(span);}
+  else if(!isDirty&&dot)dot.remove();
+ }
 }
 function syncActivityRows(){
  main.querySelectorAll('[data-row-key]').forEach(el=>{
@@ -40,13 +57,26 @@ function activeConversation(){
  }
  return null;
 }
-function markDirty(){state.dirty=true;document.querySelector('#draft-indicator').hidden=false;main.querySelectorAll('.save-state').forEach(el=>el.textContent='有未保存修改');syncExecutionButtons();}
+function markDirty(){
+ state.dirty=true;syncDraftIndicator();
+ main.querySelectorAll('.save-state').forEach(el=>el.textContent='草稿有未保存修改，保存后才会对签到任务生效');
+ const bar=main.querySelector('.save-bar');
+ if(bar){
+  bar.classList.add('is-dirty');
+  const acts=bar.querySelector('.actions');
+  if(acts&&!acts.querySelector('[data-action="discard-config"]'))acts.insertAdjacentHTML('afterbegin',button('discard-config','放弃草稿'));
+ }
+ syncExecutionButtons();
+}
 function render(){
  const focused=document.activeElement?.id,position=document.activeElement?.selectionStart;
  const inspector=main.querySelector('.inspector'),inspected=inspector?.dataset.inspectedKey,evidenceOpen=inspector?.querySelector('details')?.open;
- document.querySelector('#navigation').innerHTML=Object.entries(pages).map(([key,[label,iconName]])=>`<button type="button" id="nav-${key}" data-page="${key}" ${state.page===key?'aria-current="page"':''}>${icon(iconName)}<span>${label}</span></button>`).join('');
+ document.querySelector('#navigation').innerHTML=Object.entries(pages).map(([key,[label,iconName]])=>{
+  const dirtyDot=(key==='accounts'&&state.dirty)||(key==='automation'&&state.automationDirty)?'<span class="nav-dirty-dot" aria-hidden="true"></span>':'';
+  return `<button type="button" id="nav-${key}" data-page="${key}" ${state.page===key?'aria-current="page"':''}>${icon(iconName)}<span>${label}</span>${dirtyDot}</button>`;
+ }).join('');
  document.querySelector('#breadcrumb').textContent=pages[state.page][0];
- document.querySelector('#draft-indicator').hidden=!(state.dirty||state.automationDirty);
+ syncDraftIndicator();
  main.innerHTML=({overview:workbench,accounts:accountsView,automation:automationView,history:historyView,stats:statsView,logs:logsView}[state.page])(state);
  syncExecutionButtons();
  syncActivityRows();
@@ -56,21 +86,38 @@ function render(){
  if(focused){const next=document.getElementById(focused);if(next){next.focus();if(typeof position==='number'&&next.setSelectionRange)next.setSelectionRange(position,position);}}
 }
 
+function bannerKeyOf(status){
+ const job=status?.job;
+ if(status?.cfg_error)return 'cfg:'+status.cfg_error;
+ if(job)return `${job.id}:${job.status}`;
+ return '';
+}
 function banner(){
- const el=document.querySelector('#job-banner'),job=state.status?.job;
+ const el=document.querySelector('#job-banner'),job=state.status?.job,key=bannerKeyOf(state.status);
  if(state.status?.busy){
+  state.dismissedJobKey=null;
   el.hidden=false;
+  el.className='job-banner is-running';
   const modes={checkin:'正在签到',probe:'正在只读体检',recheck:'仅补查反馈',scan:'读取会话列表',login:'等待扫码登录'};
   el.innerHTML=`<div class="job-head"><span>${esc(modes[job?.mode]||'任务运行中')} · ${esc(job?.status==='queued'?'准备执行':job?.status==='cancelling'?'正在停止并释放浏览器':state.status.activity||'请稍候')} · ${job?.show_browser===false?'后台浏览器':'显示浏览器过程'}</span><div class="actions">${activeConversation()?button('follow-active','查看当前会话',{iconName:'search',kind:'small'}):''}${button('cancel','取消任务',{iconName:'stop',kind:'small',disabled:job?.status==='cancelling'})}</div></div><div class="job-accounts">${Object.entries(state.status.progress||{}).map(([name,item])=>`<span>${esc(name)} · ${esc(item.stage)} ${esc(item.name||'')}${esc(sendElapsed(item))}</span>`).join('')}</div>`;
  }else if(state.status?.cfg_error||job?.status==='failed'){
-  el.hidden=false;el.textContent=state.status.cfg_error||job.error||'任务失败，请查看运行日志';
+  if(state.dismissedJobKey===key){el.hidden=true;return;}
+  el.hidden=false;
+  el.className='job-banner is-error';
+  el.innerHTML=`<div class="job-head"><span>${esc(state.status.cfg_error||job.error||'任务失败，请查看运行日志')}</span><div class="actions">${button('go-logs','查看运行日志',{kind:'small',iconName:'terminal'})}${button('dismiss-banner','',{kind:'small ghost icon-only',iconName:'close',extra:'aria-label="关闭提示" title="关闭提示"'})}</div></div>`;
  }else if(job?.status==='completed'&&['checkin','recheck'].includes(job.mode)){
+  if(state.dismissedJobKey===key){el.hidden=true;return;}
   const unresolved=Object.values(job.retry_map||{}).reduce((total,chats)=>total+chats.length,0);
   const drafts=flatten(state.status).filter(row=>row.draft_warning).length;
+  const hasWarn=Boolean(unresolved||drafts||job.notification?.ok===false);
   el.hidden=false;
-  el.innerHTML=`<div class="job-head"><span>${job.mode==='recheck'?'反馈补查':'签到任务'}已结束 · ${unresolved?`${unresolved} 个会话需要核对`:'所选范围已确认完成'}${drafts?` · ${drafts} 份原草稿恢复需处理`:''}</span>${unresolved||drafts?button('show-issues','查看待处理',{kind:'small',iconName:'search'}):''}</div>`;
+  el.className='job-banner '+(hasWarn?'is-warn':'is-done');
+  el.innerHTML=`<div class="job-head"><span>${job.mode==='recheck'?'反馈补查':'签到任务'}已结束 · ${unresolved?`${unresolved} 个会话需要核对`:'所选范围已确认完成'}${drafts?` · ${drafts} 份原草稿恢复需处理`:''}</span><div class="actions">${unresolved||drafts?button('show-issues','查看待处理',{kind:'small',iconName:'search'}):''}${button('dismiss-banner','',{kind:'small ghost icon-only',iconName:'close',extra:'aria-label="关闭提示" title="关闭提示"'})}</div></div>`;
   if(job.notification?.ok===false)el.innerHTML+=`<div class="notification-error">微信推送未完成：${esc(job.notification.error)} ${button('go-automation','检查通知设置',{kind:'small'})}</div>`;
- }else el.hidden=true;
+ }else{
+  el.hidden=true;
+  el.className='job-banner';
+ }
 }
 
 async function refreshStatus(){
@@ -84,6 +131,11 @@ async function refreshStatus(){
   state.status=data;
   document.querySelector('#connection').textContent='服务已连接';
   document.querySelector('.connection-dot').classList.remove('offline');
+  const runtimeEl=document.querySelector('#sidebar-runtime');
+  if(runtimeEl){
+   const sch=data.automation?.settings;
+   runtimeEl.textContent=sch?.enabled?`每天 ${sch.time} · 自动调度已启用`:'自动调度未启用 · 手动模式';
+  }
   document.querySelector('#last-update').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
   if(previous&&previous.id===data.job?.id&&['queued','running','cancelling'].includes(previous.status)&&!data.busy){
    notify(data.job.status==='cancelled'?'任务已取消，已发出的消息请核对反馈':data.job.status==='failed'?data.job.error:'本轮执行结束，结果已更新',data.job.status==='failed');
@@ -93,6 +145,7 @@ async function refreshStatus(){
   syncExecutionButtons();
   syncActivityRows();
   if(state.page==='automation')syncAutomationRuntime();
+  if(state.page==='logs'&&state.logAutoFollow&&(data.busy||['queued','running','cancelling'].includes(previous?.status)))loadLogs().catch(()=>{});
   if(changed&&state.page==='overview'&&!composing)render();
  }catch(error){if(seq===reqSeq.status){document.querySelector('#connection').textContent='连接中断：'+error.message;document.querySelector('.connection-dot').classList.add('offline');}}
 }
@@ -122,14 +175,27 @@ async function loadAutomation(force=false){
  const data=await api('/api/automation');state.automation=data;
  state.automationDraft={schedule:copy(data.settings),notifications:{enabled:false,only_on_issues:false,...data.notifications}};
  state.automationScope=data.settings.accounts.length?'selected':'all';
- state.automationDirty=false;state.automationKey='';
+ state.automationDirty=false;state.automationKey='';state.automationClearKey=false;state.prevNotifyEnabled=false;
 }
-function markAutomationDirty(){state.automationDirty=true;document.querySelector('#draft-indicator').hidden=false;main.querySelectorAll('.save-state').forEach(el=>el.textContent='有未保存修改');main.querySelector('[data-action="test-notification"]')?.setAttribute('disabled','');const reload=main.querySelector('[data-action="reload-automation"]');if(reload)reload.textContent='放弃修改并载入';}
+function syncAutomationDirty(){
+ if(!state.automation||!state.automationDraft)return;
+ const initial={schedule:state.automation.settings,notifications:{enabled:false,only_on_issues:false,...state.automation.notifications}};
+ const current={schedule:state.automationDraft.schedule,notifications:state.automationDraft.notifications};
+ const dirty=JSON.stringify(current)!==JSON.stringify(initial)||Boolean(state.automationKey||state.automationClearKey);
+ state.automationDirty=dirty;
+ syncDraftIndicator();
+ main.querySelectorAll('.save-state').forEach(el=>el.textContent=dirty?'有未保存修改':'设置已保存');
+ const testBtn=main.querySelector('[data-action="test-notification"]');
+ if(testBtn)testBtn.disabled=dirty||!state.automation.key?.configured||state.automationClearKey||state.testingNotification;
+ const reload=main.querySelector('[data-action="reload-automation"]');
+ if(reload)reload.textContent=dirty?'放弃修改并载入':'重新载入';
+}
+function markAutomationDirty(){syncAutomationDirty();}
 async function saveAutomation(){
  if(!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(state.automationDraft.schedule.time||'')))throw new Error('定时签到时间必须为 HH:MM（00:00–23:59）');
  if(!String(state.automationDraft.schedule.timezone||'').trim())throw new Error('请填写有效的运行时区');
  if(state.automationScope==='selected'&&!state.automationDraft.schedule.accounts.length)throw new Error('请至少勾选一个定时账号，或明确选择全部账号');
- await api('/api/automation',{...state.automationDraft,revision:state.automation.revision,...(state.automationKey?{sendkey:state.automationKey}:{})});
+ await api('/api/automation',{...state.automationDraft,revision:state.automation.revision,...(state.automationKey?{sendkey:state.automationKey}:state.automationClearKey?{clear_sendkey:true}:{})});
  await loadAutomation(true);
  if(state.dirty){state.draft.schedule=copy(state.automationDraft.schedule);state.draft.notifications=copy(state.automationDraft.notifications);state.revision=state.automation.revision;}
  else await loadConfig(true);
@@ -148,10 +214,26 @@ async function saveConfig(){
  await loadConfig(true);await refreshStatus();render();notify('配置已保存');
 }
 
+function readHistoryForm(){
+ const form=main.querySelector('#history-filters');
+ if(!form)return;
+ const next=Object.fromEntries(new FormData(form));
+ if(next.from&&next.to&&next.from>next.to){[next.from,next.to]=[next.to,next.from];notify('已自动调整起止日期顺序');}
+ state.historyFilter=next;
+}
+function shiftDay(baseStr,deltaDays){
+ const [y,m,d]=baseStr.split('-').map(Number);
+ return new Date(Date.UTC(y,m-1,d+deltaDays)).toISOString().slice(0,10);
+}
+function scrollLogsBottom(){
+ if(state.page!=='logs'||!state.logAutoFollow)return;
+ const box=main.querySelector('.log-output');
+ if(box)box.scrollTop=box.scrollHeight;
+}
 const historyQuery=()=>new URLSearchParams({...state.historyFilter,page:state.historyPage,limit:100});
 async function loadHistory(){const seq=++reqSeq.history;const data=await api('/api/history?'+historyQuery());if(seq!==reqSeq.history)return;state.history=data;if(state.page==='history')render();}
 async function loadStats(){const seq=++reqSeq.stats;const data=await api('/api/stats?days='+state.statsDays);if(seq!==reqSeq.stats)return;state.stats=data;if(state.page==='stats')render();}
-async function loadLogs(){const seq=++reqSeq.logs;const data=await api('/api/logs?'+new URLSearchParams({level:state.logLevel,q:state.logQuery}));if(seq!==reqSeq.logs)return;state.logs=data.text;if(state.page==='logs')render();}
+async function loadLogs(){const seq=++reqSeq.logs;const data=await api('/api/logs?'+new URLSearchParams({level:state.logLevel,q:state.logQuery}));if(seq!==reqSeq.logs)return;state.logs=data.text;if(state.page==='logs'){render();scrollLogsBottom();}}
 function closePickerDom(){
  state.openPicker=null;
  main.querySelectorAll('.picker-popover').forEach(p=>p.remove());
@@ -174,6 +256,11 @@ function openPickerDom(kind,focusSearch=false){
  wrap.querySelector('.picker-trigger')?.setAttribute('aria-expanded','true');
  const html=kind==='time'?timePopoverHtml(state.automationDraft.schedule.time):timezonePopoverHtml(state.automationDraft.schedule.timezone,state.tzQuery,state.tzShowAll);
  wrap.insertAdjacentHTML('beforeend',html);
+ const pop=wrap.querySelector('.picker-popover');
+ if(pop){
+  const rect=pop.getBoundingClientRect(),wrapRect=wrap.getBoundingClientRect();
+  if(rect.bottom>window.innerHeight-12&&wrapRect.top>rect.height+16)pop.classList.add('is-flipped');
+ }
  scrollPickerSelected();
  if(kind==='timezone'&&focusSearch)wrap.querySelector('#tz-search')?.focus();
 }
@@ -189,10 +276,10 @@ function syncTimePickerDom(value){
  const {hour,minute}=parseTimeParts(value);
  main.querySelectorAll('.time-preset').forEach(btn=>btn.classList.toggle('active',btn.dataset.time===value));
  main.querySelectorAll('[data-time-col="hour"] .time-cell').forEach(btn=>{
-  const on=btn.dataset.hour===hour;btn.classList.toggle('active',on);if(on)btn.dataset.selected='true';else delete btn.dataset.selected;
+  const on=btn.dataset.hour===hour;btn.classList.toggle('active',on);btn.setAttribute('tabindex',on?'0':'-1');if(on)btn.dataset.selected='true';else delete btn.dataset.selected;
  });
  main.querySelectorAll('[data-time-col="minute"] .time-cell').forEach(btn=>{
-  const on=btn.dataset.minute===minute;btn.classList.toggle('active',on);if(on)btn.dataset.selected='true';else delete btn.dataset.selected;
+  const on=btn.dataset.minute===minute;btn.classList.toggle('active',on);btn.setAttribute('tabindex',on?'0':'-1');if(on)btn.dataset.selected='true';else delete btn.dataset.selected;
  });
 }
 async function navigate(page){
@@ -214,9 +301,9 @@ window.addEventListener('hashchange',()=>{const raw=location.hash.slice(1);const
 function showModal(html,label='操作窗口'){modal.setAttribute('aria-label',label);modal.innerHTML=html;if(!modal.open)modal.showModal();}
 function closeModal(){modal.close();state.editor=null;state.pendingPlan=null;state.pendingDelete=null;}
 function selectedRow(key=state.selected){return flatten(state.status).find(row=>keyOf(row)===key);}
-function openEditor(index){
+function openEditor(index,options={}){
  const account=state.draft.accounts[state.accountIndex];
- state.editor={index,group:copy(index<0?{chat:'',method:'text',message:'签到',reply_mode:state.draft.reply_mode||'reply_only'}:account.groups[index]),actions:[]};
+ state.editor={index,group:copy(index<0?{chat:'',method:'text',message:'签到',reply_mode:state.draft.reply_mode||'reply_only'}:account.groups[index]),actions:[],advancedOpen:Boolean(options.advancedOpen)};
  state.editor.actions=actionsOf(state.editor.group);
  drawEditor();
 }
@@ -301,12 +388,22 @@ function drawChooser(){
  const count=cc.loading?'正在连接 Telegram 并读取会话…':`${list.length} 个会话 · 已选 ${cc.checked.size} 个${cc.updated?' · '+(cc.cached?'缓存于 ':'更新于 ')+esc(cc.updated):''}`;
  const rows=list.map(d=>`<div class="chooser-row"><input type="checkbox" data-choose-check="${esc(d.id)}" aria-label="勾选 ${esc(d.title||d.id)}" ${cc.loading||d.is_forum?'disabled':''} ${d.is_forum?'title="论坛群请单独选择话题"':''} ${cc.checked.has(String(d.id))?'checked':''}><div class="identity">${esc(d.title||d.id)}<small>${esc(d.id)} · ${esc(d.type||'')}</small></div>${button('choose-one',d.is_forum?'选择话题':'选用',{kind:'small',disabled:cc.loading,extra:`data-id="${esc(d.id)}"`})}</div>`).join('');
  const emptyText=cc.loading?'读取中…':cc.error?'读取未完成，可刷新列表或返回填写会话 ID。':cc.query?'没有匹配的会话':'当前列表没有会话';
- chooser.innerHTML=`<div class="dialog-heading"><h2>从 Telegram 会话中选择</h2>${button('close-chooser','返回规则编辑',{kind:'dialog-close',iconName:'close'})}</div>
+ const closeLabel=state.editor?.standaloneBatch?'关闭':'返回规则编辑';
+ const batchNote=state.editor?.standaloneBatch?'批量添加将使用默认「文字签到（签到）」，加入草稿后可逐群编辑。':'批量添加将复用当前编辑窗口中的签到动作。';
+ chooser.innerHTML=`<div class="dialog-heading"><h2>从 Telegram 会话中选择</h2>${button('close-chooser',closeLabel,{kind:'dialog-close',iconName:'close'})}</div>
  <div class="toolbar"><div class="search-group"><select data-control="chooser-folder" aria-label="Telegram 文件夹" ${cc.loading?'disabled':''}>${option('','全部会话',cc.folder)}${cc.folders.map(f=>option(f,f,cc.folder)).join('')}</select><input id="chooser-search" data-control="chooser-search" aria-label="搜索会话" placeholder="搜索会话" value="${esc(cc.query)}"></div>${button('refresh-chooser','刷新列表',{iconName:'refresh',disabled:cc.loading})}</div>
  <p class="small-note" role="status">${cc.error&&!cc.dialogs.length?'会话列表读取失败':count}</p>${cc.error?`<div class="dialog-error" role="alert">${esc(cc.error)}</div>`:''}
  <div class="chooser-list" aria-busy="${cc.loading}">${rows||`<div class="empty-state">${emptyText}</div>`}</div>
- <p class="small-note">普通会话可批量添加；论坛群请单独选择话题。已有会话自动跳过。</p>
+ <p class="small-note">${batchNote}普通会话可批量添加；论坛群请单独选择话题。已有会话自动跳过。</p>
  <div class="dialog-actions">${button('close-chooser','返回')}${button('choose-batch',`添加选中的 ${cc.checked.size} 个会话`,{primary:true,disabled:!cc.checked.size||cc.loading})}</div>`;
+}
+
+function planProbe(){
+ if(state.status?.busy)throw new Error('当前任务正在运行，请等待结束或取消任务');
+ const rows=flatten(state.status).filter(r=>!state.accountFilter||r.account===state.accountFilter);
+ if(!rows.length){notify('没有可体检的会话');return;}
+ const scopeText=state.accountFilter?`账号「${state.accountFilter}」下的 ${rows.length} 个会话`:`全部账号共 ${rows.length} 个会话`;
+ showModal(`<h2>确认只读体检</h2><p class="muted">将逐一打开${esc(scopeText)}，核对会话标题、话题与输入框可用性，<strong>不会发送任何消息</strong>。</p><div class="evidence-block draft-warning"><div class="eyebrow">注意未读标记</div><p class="small-note">打开会话时，Telegram 会将这些会话的未读消息标为已读。</p></div><div class="dialog-actions">${button('close-modal','取消')}${button('confirm-probe','开始只读体检',{primary:true,iconName:'shield'})}</div>`,'确认只读体检');
 }
 
 function plan({row=null,account=null}={}){
@@ -334,9 +431,19 @@ async function removeAccount(index){
 }
 
 async function onAction(el){
+ if(el.dataset.action==='go-dirty'){
+  const target=state.dirty?'accounts':state.automationDirty?'automation':'overview';
+  await navigate(target);
+  main.querySelector('.save-bar, .page-heading')?.scrollIntoView({behavior:'smooth',block:'nearest'});
+  return;
+ }
+ if(el.dataset.action==='go-logs')return navigate('logs');
+ if(el.dataset.action==='dismiss-banner'){state.dismissedJobKey=bannerKeyOf(state.status);banner();return;}
  if(el.dataset.action==='go-automation')return navigate('automation');
  if(el.dataset.action==='save-automation'){state.openPicker=null;return saveAutomation();}
  if(el.dataset.action==='reload-automation'){state.openPicker=null;await loadAutomation(true);render();return;}
+ if(el.dataset.action==='clear-sendkey'){state.prevNotifyEnabled=Boolean(state.automationDraft.notifications.enabled);state.automationClearKey=true;state.automationKey='';state.automationDraft.notifications.enabled=false;syncAutomationDirty();render();return;}
+ if(el.dataset.action==='undo-clear-sendkey'){state.automationClearKey=false;if(state.prevNotifyEnabled)state.automationDraft.notifications.enabled=true;state.prevNotifyEnabled=false;syncAutomationDirty();render();return;}
  if(el.dataset.action==='toggle-time-picker'){togglePicker('time');return;}
  if(el.dataset.action==='toggle-tz-picker'){togglePicker('timezone');return;}
  if(el.dataset.action==='close-picker'){closePickerDom();return;}
@@ -389,7 +496,8 @@ async function onAction(el){
  if(action==='retry'||action==='run-chat'){const row=selectedRow(el.dataset.key);if(!row)throw new Error('此会话尚未保存或已移除，请保存配置并刷新后再执行');plan({row});}
  if(action==='confirm-run'){if(!state.pendingPlan)throw new Error('执行预览已失效，请重新选择签到目标');const params={...state.pendingPlan,show_browser:document.querySelector('#show-run-browser').checked};closeModal();await startJob('checkin_now',params);}
  if(action==='cancel'){await api('/api/cancel',{});await refreshStatus();}
- if(action==='probe')await startJob('probe',state.accountFilter?{account:state.accountFilter}:{});
+ if(action==='probe')planProbe();
+ if(action==='confirm-probe'){closeModal();await startJob('probe',state.accountFilter?{account:state.accountFilter}:{});}
  if(action==='probe-chat'){const row=selectedRow(el.dataset.key);if(!row)throw new Error('目标会话已改变，请刷新后重试');await startJob('probe',{account:row.account,chats:[row.chat]});}
  if(action==='recheck'){const row=selectedRow(el.dataset.key);if(!row)throw new Error('目标会话已改变，请刷新后重试');await startJob('recheck',{account:row.account,chats:[row.chat]});}
  if(action==='edit-selected'){
@@ -398,20 +506,48 @@ async function onAction(el){
   const accountIndex=mappedIndex>=0?mappedIndex:state.draft.accounts.findIndex(a=>a.name===row.account);
   const groupIndex=accountIndex<0?-1:state.draft.accounts[accountIndex].groups.findIndex(g=>String(g.chat)===row.chat);
   if(groupIndex<0)throw new Error('当前配置草稿已修改或移除此会话，请先核对草稿');
-  state.accountIndex=accountIndex;await navigate('accounts');openEditor(groupIndex);
+  state.accountIndex=accountIndex;await navigate('accounts');openEditor(groupIndex,{advancedOpen:true});
  }
  if(action==='save-config')await saveConfig();
  if(action==='discard-config')showModal(`<h2>重新载入已保存的配置？</h2><p class="muted">当前尚未保存的草稿修改将被放弃。</p><div class="dialog-actions">${button('close-modal','保留草稿')}${button('confirm-discard','放弃草稿并载入')}</div>`,'重新载入配置');
- if(action==='confirm-discard'){await loadConfig(true);closeModal();render();notify('已重新载入保存的配置');}
+ if(action==='confirm-discard'){state.groupQuery='';await loadConfig(true);closeModal();render();notify('已重新载入保存的配置');}
  if(action==='add-account')showModal(`<form id="account-form"><h2>添加账号</h2><p class="muted">只需一个名称，不需要 API 凭据。保存后扫码登录。</p><label class="field">账号名称<input name="name" required placeholder="例如：备用账号"></label><div class="dialog-actions">${button('close-modal','取消')}<button type="submit" class="primary">添加到草稿</button></div></form>`,'添加账号');
- if(action==='manage-account'){state.accountIndex=index;state.checkedGroups.clear();render();}
+ if(action==='manage-account'){state.accountIndex=index;state.checkedGroups.clear();state.groupQuery='';render();}
  if(action==='login'){const a=state.draft.accounts[index];if(state.dirty)throw new Error('请先保存账号配置，再扫码登录');await api('/api/web_login',{account:a.name});await refreshStatus();notify('浏览器已启动，请用手机扫码，登录完成后自动关闭');}
+ if(action==='clear-session'){
+  if(state.dirty)throw new Error('请先保存配置草稿，再清除登录会话');
+  const acc=state.draft.accounts[index],targetName=state.origins.get(acc)||acc.name;
+  state.pendingDelete={type:'session',index,name:targetName};
+  showModal(`<h2>清除本地登录会话？</h2><p class="muted">将退出「${esc(targetName)}」在本地保存的浏览器登录资料，<strong>账号配置、全部群规则与历史记录将完整保留</strong>。后续执行前需重新扫码。</p><div class="dialog-actions">${button('close-modal','取消')}${button('confirm-clear-session','确认清除会话',{kind:'danger'})}</div>`,'清除登录会话');
+ }
+ if(action==='confirm-clear-session'){await api('/api/delete_session',{account:state.pendingDelete.name});closeModal();await refreshStatus();render();notify('已清除本地登录会话，群规则已保留');}
  if(action==='delete-account')await removeAccount(index);
  if(action==='confirm-delete'){const result=await api('/api/delete_account',{account:state.pendingDelete.name,revision:state.revision});closeModal();await loadConfig(true);await refreshStatus();render();notify('账号已移除');for(const warning of result.warnings||[])notify(warning,true);}
  if(action==='add-group')openEditor(-1);
+ if(action==='batch-add-groups'){
+  state.editor={index:-1,standaloneBatch:true,group:{chat:'',method:'text',message:'签到',reply_mode:state.draft.reply_mode||'reply_only'},actions:[{method:'text',message:'签到'}]};
+  state.chooser={dialogs:[],folders:[],checked:new Set(),query:'',folder:'',loading:false,error:''};
+  await openChooser();
+ }
  if(action==='edit-group')openEditor(index);
- if(action==='delete-group'){account.groups.splice(index,1);state.checkedGroups.clear();markDirty();render();}
- if(action==='delete-groups'){account.groups=account.groups.filter((g,i)=>!state.checkedGroups.has(i));state.checkedGroups.clear();markDirty();render();}
+ if(action==='move-group-up'||action==='move-group-down'){
+  const other=index+(action==='move-group-up'?-1:1);
+  if(other<0||other>=account.groups.length)return;
+  [account.groups[index],account.groups[other]]=[account.groups[other],account.groups[index]];
+  state.checkedGroups.clear();markDirty();render();
+ }
+ if(action==='delete-group'){
+  const g=account.groups[index];
+  state.pendingDelete={type:'group',index,name:g.title||g.chat};
+  showModal(`<h2>删除会话规则？</h2><p class="muted">将从账号「${esc(account.name)}」草稿中移除「${esc(g.title||g.chat)}」。保存配置后生效。</p><div class="dialog-actions">${button('close-modal','保留')}${button('confirm-delete-group','移除此会话',{kind:'danger'})}</div>`,'删除会话规则');
+ }
+ if(action==='confirm-delete-group'){account.groups.splice(state.pendingDelete.index,1);state.checkedGroups.clear();markDirty();closeModal();render();}
+ if(action==='delete-groups'){
+  const count=state.checkedGroups.size;if(!count)return;
+  state.pendingDelete={type:'groups',count};
+  showModal(`<h2>批量删除会话规则？</h2><p class="muted">将从账号「${esc(account.name)}」草稿中移除选中的 ${count} 个会话。保存配置后生效。</p><div class="dialog-actions">${button('close-modal','保留')}${button('confirm-delete-groups',`移除 ${count} 个会话`,{kind:'danger'})}</div>`,'批量删除会话');
+ }
+ if(action==='confirm-delete-groups'){account.groups=account.groups.filter((g,i)=>!state.checkedGroups.has(i));state.checkedGroups.clear();markDirty();closeModal();render();}
  if(action==='assign-system'||action==='clear-system'){
   const system=action==='clear-system'?'':document.querySelector('#bulk-system').value.trim();if(action==='assign-system'&&!system)throw new Error('请输入共用系统名称');
   state.checkedGroups.forEach(i=>{account.groups[i].share_group=system;delete account.groups[i].primary;});markDirty();render();
@@ -420,12 +556,12 @@ async function onAction(el){
  if(action==='open-chooser'){state.chooser={dialogs:[],folders:[],checked:new Set(),query:'',folder:'',loading:false,error:''};await openChooser();}
  if(action==='load-topics')await loadEditorTopics(true);
  if(action==='refresh-chooser')await openChooser(true);
- if(action==='close-chooser')chooser.close();
+ if(action==='close-chooser'){chooser.close();if(state.editor?.standaloneBatch)state.editor=null;}
  if(action==='choose-one'){
   const dialog=state.chooser.dialogs.find(d=>String(d.id)===el.dataset.id),g=state.editor.group;
   if(String(g.chat)!==String(dialog.id)){delete g.topic;delete g.topic_id;delete g.is_forum;}
   g.chat=String(dialog.id);g.title=dialog.title;g.folder=state.chooser.folder||'';
-  state.editor.topics=null;state.editor.topicsError='';
+  state.editor.topics=null;state.editor.topicsError='';state.editor.standaloneBatch=false;
   chooser.close();
   if(!String(dialog.id).startsWith('-')){g.is_forum=false;delete g.topic;delete g.topic_id;state.editor.topics={is_forum:false,topics:[]};drawEditor();}
   else await loadEditorTopics();
@@ -475,23 +611,44 @@ async function onAction(el){
  }
  if(action==='history-prev'||action==='history-next'){const prev=state.historyPage;state.historyPage=Math.max(1,prev+(action==='history-prev'?-1:1));try{await loadHistory();}catch(error){state.historyPage=prev;throw error;}}
  if(action==='history-reset'){state.historyFilter={q:'',account:'',status:'',from:'',to:''};state.historyPage=1;await loadHistory();}
- if(action==='export-history')await download('/api/history/download?'+historyQuery(),'checkin-history.csv');
+ if(action==='history-range'){
+  const days=Number(el.dataset.days||1);
+  const end=state.status?.today||new Date().toISOString().slice(0,10);
+  state.historyFilter={...state.historyFilter,from:shiftDay(end,-(days-1)),to:end};
+  state.historyPage=1;await loadHistory();
+ }
+ if(action==='export-history'){readHistoryForm();await download('/api/history/download?'+historyQuery(),'checkin-history.csv');}
+ if(action==='stats-drill'){
+  const date=el.dataset.date||'',acc=el.dataset.account||'';
+  const end=state.status?.today||new Date().toISOString().slice(0,10);
+  const from=date||(acc?shiftDay(end,-(state.statsDays-1)):'');
+  const to=date||(acc?end:'');
+  state.historyFilter={q:'',account:acc,status:'',from,to};
+  state.historyPage=1;await navigate('history');
+ }
  if(action==='download-logs')await download('/api/logs/download','checkin.log');
  if(action==='refresh-logs')await loadLogs();
+ if(action==='log-reset'){state.logLevel='';state.logQuery='';await loadLogs();}
  if(action==='export-config'){
   const url=URL.createObjectURL(new Blob([JSON.stringify(state.draft,null,2)],{type:'application/json'}));const link=document.createElement('a');link.href=url;link.download='checkin-config.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
  }
  if(action==='import-config')document.querySelector('#config-file').click();
 }
 
-const inFlightActions=new Set(['save-config','save-automation','confirm-run','confirm-delete','cancel','login','history-prev','history-next']);
+const inFlightActions=new Set(['save-config','save-automation','confirm-run','confirm-probe','confirm-delete','confirm-clear-session','cancel','login','history-prev','history-next']);
 document.addEventListener('click',event=>{
  if(state.openPicker&&!event.target.closest('.picker-wrap'))closePickerDom();
  if(event.target.id==='schedule-time'&&state.openPicker!=='time'){openPickerDom('time',false);return;}
  if(event.target.id==='schedule-timezone'&&state.openPicker!=='timezone'){openPickerDom('timezone',false);return;}
  const el=event.target.closest('button');if(!el||el.disabled)return;
- if(el.dataset.page){navigate(el.dataset.page).catch(e=>notify(e.message,true));return;}
- if(el.dataset.filter){state.filter=el.dataset.filter;render();return;}
+ if(el.dataset.page){
+  if(event.ctrlKey||event.metaKey){window.open('#'+el.dataset.page,'_blank');return;}
+  navigate(el.dataset.page).catch(e=>notify(e.message,true));return;
+ }
+ if(el.dataset.filter){
+  state.filter=el.classList.contains('metric-card')&&state.filter===el.dataset.filter?'all':el.dataset.filter;
+  render();return;
+ }
  if(el.dataset.action){
   const lockBtn=inFlightActions.has(el.dataset.action);
   if(lockBtn)el.disabled=true;
@@ -507,9 +664,35 @@ document.addEventListener('click',event=>{
   }).finally(()=>{if(lockBtn&&el.isConnected)el.disabled=false;});
  }
 });
+document.addEventListener('auxclick',event=>{
+ if(event.button!==1)return;
+ const el=event.target.closest('button[data-page]');
+ if(el){event.preventDefault();window.open('#'+el.dataset.page,'_blank');}
+});
 
 document.addEventListener('keydown',event=>{
- if(event.key==='Escape'&&state.openPicker)closePickerDom();
+ if(event.key==='Escape'&&state.openPicker){closePickerDom();return;}
+ const el=event.target;
+ if(el?.classList?.contains('time-cell')&&['ArrowDown','ArrowUp','Home','End'].includes(event.key)){
+  event.preventDefault();
+  const list=el.closest('.time-col-list');
+  const items=list?[...list.querySelectorAll('.time-cell')]:[];
+  const idx=items.indexOf(el);
+  if(idx<0)return;
+  const nextIdx=event.key==='Home'?0:event.key==='End'?items.length-1:(idx+(event.key==='ArrowDown'?1:-1)+items.length)%items.length;
+  const target=items[nextIdx];
+  items.forEach(item=>item.setAttribute('tabindex',item===target?'0':'-1'));
+  target.focus();target.click();target.scrollIntoView({block:'nearest'});
+ }
+ if((el?.id==='tz-search'||el?.classList?.contains('tz-option'))&&['ArrowDown','ArrowUp'].includes(event.key)){
+  const list=main.querySelector('.tz-list');
+  const items=list?[...list.querySelectorAll('.tz-option')]:[];
+  if(!items.length)return;
+  event.preventDefault();
+  const idx=items.indexOf(el);
+  const nextIdx=idx<0?(event.key==='ArrowDown'?0:items.length-1):(idx+(event.key==='ArrowDown'?1:-1)+items.length)%items.length;
+  items[nextIdx].focus();items[nextIdx].scrollIntoView({block:'nearest'});
+ }
 });
 document.addEventListener('focusout',event=>{
  const el=event.target;
@@ -530,6 +713,7 @@ document.addEventListener('compositionend',event=>{
  composing=false;
  const el=event.target;
  if(el?.dataset?.control==='search'){state.query=el.value;render();}
+ if(el?.dataset?.control==='group-search'){state.groupQuery=el.value;render();}
  if(el?.dataset?.control==='tz-search'){state.tzQuery=el.value;const list=main.querySelector('.tz-list');if(list)list.innerHTML=renderTimezoneList(state.automationDraft.schedule.timezone,state.tzQuery,state.tzShowAll);}
  if(el?.dataset?.control==='chooser-search'){state.chooser.query=el.value;const pos=el.selectionStart;drawChooser();const next=document.querySelector('#chooser-search');next?.focus();if(typeof pos==='number')next?.setSelectionRange(pos,pos);}
 });
@@ -545,6 +729,7 @@ document.addEventListener('input',event=>{
   }
   if(key==='time'&&state.openPicker==='time')syncTimePickerDom(el.value);
   markAutomationDirty();
+  if(el.type==='checkbox'&&key==='enabled')el.closest('.panel')?.classList.toggle('is-disabled-module',!el.checked);
  }
  if(el.dataset.control==='tz-search'){
   state.tzQuery=el.value;
@@ -552,14 +737,33 @@ document.addEventListener('input',event=>{
  }
  if(el.dataset.scheduleScope){state.automationScope=el.dataset.scheduleScope;state.automationDraft.schedule.accounts=state.automationScope==='all'?[]:(state.automationDraft.schedule.accounts.length?state.automationDraft.schedule.accounts:(state.status?.accounts||[]).map(a=>a.name));markAutomationDirty();render();}
  if(el.dataset.scheduleAccount){const names=new Set(state.automationDraft.schedule.accounts);el.checked?names.add(el.dataset.scheduleAccount):names.delete(el.dataset.scheduleAccount);state.automationDraft.schedule.accounts=[...names];markAutomationDirty();}
- if(el.dataset.notification){state.automationDraft.notifications[el.dataset.notification]=el.checked;markAutomationDirty();}
- if(el.id==='serverchan-key'){state.automationKey=el.value.trim();markAutomationDirty();}
+ if(el.dataset.notification){
+  state.automationDraft.notifications[el.dataset.notification]=el.checked;
+  markAutomationDirty();
+  if(el.dataset.notification==='enabled')el.closest('.panel')?.classList.toggle('is-disabled-module',!el.checked);
+ }
+ if(el.id==='serverchan-key'){
+  state.automationKey=el.value.trim();
+  if(state.automationKey&&state.automationClearKey){
+   state.automationClearKey=false;
+   if(state.prevNotifyEnabled)state.automationDraft.notifications.enabled=true;
+   state.prevNotifyEnabled=false;
+   render();
+  }
+  markAutomationDirty();
+ }
  if(el.dataset.control==='search'){state.query=el.value;if(!composing)render();}
+ if(el.dataset.control==='group-search'){state.groupQuery=el.value;if(!composing)render();}
  if(el.dataset.control==='chooser-search'){state.chooser.query=el.value;if(!composing){const pos=el.selectionStart;drawChooser();const next=document.querySelector('#chooser-search');next?.focus();if(typeof pos==='number')next?.setSelectionRange(pos,pos);}}
  if(el.dataset.accountName!==undefined){state.draft.accounts[Number(el.dataset.accountName)].name=el.value;markDirty();}
  if(el.dataset.delay){const [type,side]=el.dataset.delay.split(':'),key=type+'_delay_seconds';const values=range(state.draft[key],type==='account'?[0,0]:[1,3]);values[Number(side)]=Number(el.value);state.draft[key]=values;markDirty();}
  if(el.dataset.global){const key=el.dataset.global;state.draft[key]=el.type==='checkbox'?el.checked:key.endsWith('_keywords')?words(el.value):el.type==='number'?Number(el.value):el.value;markDirty();}
- if(el.dataset.editor){const key=el.dataset.editor;state.editor.group[key]=el.type==='checkbox'?el.checked:key.endsWith('_keywords')?words(el.value):el.value;if(key==='topic')delete state.editor.group.topic_id;if(key==='chat'){const hadTopicUI=!!(state.editor.group.is_forum||state.editor.topics||state.editor.topicsError);delete state.editor.group.topic;delete state.editor.group.topic_id;delete state.editor.group.is_forum;state.editor.topics=null;state.editor.topicsError='';state.editor.topicRequest=null;state.editor.topicsLoading=false;state.editor.chatChanged=hadTopicUI;}}
+ if(el.dataset.editor){
+  const key=el.dataset.editor;state.editor.group[key]=el.type==='checkbox'?el.checked:key.endsWith('_keywords')?words(el.value):el.value;
+  if(key==='share_group'){const box=modal.querySelector('[data-editor="primary"]');if(box){const has=!!el.value.trim();box.disabled=!has;if(!has){box.checked=false;delete state.editor.group.primary;}}}
+  if(key==='topic')delete state.editor.group.topic_id;
+  if(key==='chat'){const hadTopicUI=!!(state.editor.group.is_forum||state.editor.topics||state.editor.topicsError);delete state.editor.group.topic;delete state.editor.group.topic_id;delete state.editor.group.is_forum;state.editor.topics=null;state.editor.topicsError='';state.editor.topicRequest=null;state.editor.topicsLoading=false;state.editor.chatChanged=hadTopicUI;}
+ }
  if(el.dataset.actionField){const key=el.dataset.actionField;const action=state.editor.actions[Number(el.dataset.index)];action[key]=['image','button_message'].includes(key)||key==='click_button'&&action.method==='button_only'?el.value:normalizeValue(el.value);}
 });
 
@@ -570,30 +774,50 @@ document.addEventListener('change',event=>{
  if(['kindFilter','methodFilter','structureFilter','systemFilter'].includes(el.dataset.classification)){state[el.dataset.classification]=el.value;render();}
  if(el.dataset.control==='account-filter'){state.accountFilter=el.value;render();}
  if(el.dataset.control==='stats-days'){state.statsDays=Number(el.value);loadStats().catch(e=>notify(e.message,true));}
+ if(el.dataset.control==='log-level'){state.logLevel=el.value;loadLogs().catch(e=>notify(e.message,true));}
+ if(el.dataset.control==='log-follow'){state.logAutoFollow=el.checked;if(el.checked)scrollLogsBottom();}
+ if(el.closest('#history-filters')&&(el.tagName==='SELECT'||el.type==='date')){readHistoryForm();state.historyPage=1;loadHistory().catch(e=>notify(e.message,true));}
  if(el.dataset.control==='chooser-folder'){state.chooser.folder=el.value;openChooser().catch(e=>notify(e.message,true));}
  if(el.dataset.chooseCheck!==undefined){el.checked?state.chooser.checked.add(el.dataset.chooseCheck):state.chooser.checked.delete(el.dataset.chooseCheck);drawChooser();}
  if(el.dataset.groupCheck!==undefined){el.checked?state.checkedGroups.add(Number(el.dataset.groupCheck)):state.checkedGroups.delete(Number(el.dataset.groupCheck));render();}
- if(el.dataset.control==='select-all-groups'){state.checkedGroups=el.checked?new Set(state.draft.accounts[state.accountIndex].groups.map((_,i)=>i)):new Set();render();}
+ if(el.dataset.control==='select-all-groups'){const visible=[...main.querySelectorAll('[data-group-check]')].map(x=>Number(x.dataset.groupCheck));visible.forEach(i=>el.checked?state.checkedGroups.add(i):state.checkedGroups.delete(i));render();}
  if(el.dataset.systemPrimary!==undefined){state.draft.accounts[state.accountIndex].groups.filter(g=>g.share_group===el.dataset.systemPrimary).forEach(g=>{if(String(g.chat)===el.value)g.primary=true;else delete g.primary;});markDirty();}
  if(el.dataset.actionMethod!==undefined){state.editor.actions[Number(el.dataset.actionMethod)].method=el.value;drawEditor();}
  if(el.id==='theme'){localStorage.setItem('theme',el.value);applyTheme(el.value);}
- if(el.id==='config-file'&&el.files[0]){const file=el.files[0];el.value='';file.text().then(text=>{const cfg=JSON.parse(text);if(!cfg||!Array.isArray(cfg.accounts))throw new Error('配置文件必须包含 accounts 数组');state.draft=cfg;state.origins=new WeakMap();cfg.accounts.forEach(a=>{a.groups??=[];if(state.cfg.accounts.some(old=>old.name===a.name))state.origins.set(a,a.name);});state.accountIndex=0;state.checkedGroups.clear();markDirty();render();notify('配置已导入草稿，保存前请核对账号与会话');}).catch(e=>notify(e.message,true));}
+ if(el.id==='config-file'&&el.files[0]){
+  const file=el.files[0];el.value='';
+  file.text().then(async text=>{
+   const {cfg}=await api('/api/config/parse',{text});
+   if(!cfg.schedule&&state.cfg?.schedule)cfg.schedule=copy(state.cfg.schedule);
+   if(!cfg.notifications&&state.cfg?.notifications)cfg.notifications=copy(state.cfg.notifications);
+   state.draft=cfg;state.origins=new WeakMap();
+   cfg.accounts.forEach(a=>{a.groups??=[];if(state.cfg.accounts.some(old=>old.name===a.name))state.origins.set(a,a.name);});
+   state.accountIndex=0;state.checkedGroups.clear();state.groupQuery='';markDirty();render();
+   notify('配置已导入草稿（已保留未包含的定时与通知设置），保存前请核对');
+  }).catch(e=>notify(e.message,true));
+ }
 });
 
 document.addEventListener('submit',event=>{
  const form=event.target;event.preventDefault();
  (async()=>{
   if(form.id==='token-form'){sessionStorage.setItem('gui_token',document.querySelector('#token-input').value.trim());document.querySelector('#token-dialog').close();await Promise.allSettled([loadConfig(true),refreshStatus()]);if(state.page==='automation')await loadAutomation(true);if(state.page==='history')await loadHistory();if(state.page==='stats')await loadStats();if(state.page==='logs')await loadLogs();render();}
-  if(form.id==='account-form'){const name=new FormData(form).get('name').trim();if(state.draft.accounts.some(a=>a.name.toLowerCase()===name.toLowerCase()))throw new Error('已有同名账号');state.draft.accounts.push({name,groups:[]});state.accountIndex=state.draft.accounts.length-1;markDirty();closeModal();render();}
+  if(form.id==='account-form'){const name=new FormData(form).get('name').trim();if(state.draft.accounts.some(a=>a.name.toLowerCase()===name.toLowerCase()))throw new Error('已有同名账号');state.draft.accounts.push({name,groups:[]});state.accountIndex=state.draft.accounts.length-1;state.groupQuery='';markDirty();closeModal();render();}
   if(form.id==='group-form')await saveEditor();
-  if(form.id==='history-filters'){state.historyFilter=Object.fromEntries(new FormData(form));state.historyPage=1;await loadHistory();}
+  if(form.id==='history-filters'){readHistoryForm();state.historyPage=1;await loadHistory();}
   if(form.id==='log-filters'){const data=new FormData(form);state.logLevel=data.get('level');state.logQuery=data.get('q');await loadLogs();}
-  if(form.id==='judge-form'){const result=await api('/api/judge',{text:new FormData(form).get('text'),group:state.judgeGroup,settings:{success_keywords:state.draft.success_keywords,fail_keywords:state.draft.fail_keywords}});const box=document.querySelector('#judge-result');box.hidden=false;box.textContent=({success:'匹配成功话术',failed:'匹配失败话术',unconfirmed:'没有匹配到判定词'})[result.confirm]+' · 命中：'+Object.values(result.hits).flat().join('、');}
+  if(form.id==='judge-form'){
+   const result=await api('/api/judge',{text:new FormData(form).get('text'),group:state.judgeGroup,settings:{success_keywords:state.draft.success_keywords,fail_keywords:state.draft.fail_keywords}});
+   const box=document.querySelector('#judge-result'),hits=Object.values(result.hits).flat();
+   box.hidden=false;box.textContent=({success:'匹配成功话术',failed:'匹配失败话术',unconfirmed:'没有匹配到判定词'})[result.confirm]+(hits.length?' · 命中：'+hits.join('、'):' · 未命中任何成功或失败词');
+  }
  })().catch(error=>{const box=document.querySelector('#editor-error');if(form.id==='group-form'&&box){box.hidden=false;box.textContent=error.message;box.scrollIntoView({block:'nearest'});}else notify(error.message,true);});
 });
 
 modal.addEventListener('cancel',event=>{if(state.editor){event.preventDefault();notify('请使用保存到草稿或取消按钮关闭，避免丢失规则修改');}});
 modal.addEventListener('close',()=>{state.editor=null;state.pendingPlan=null;state.pendingDelete=null;});
+modal.addEventListener('toggle',event=>{if(event.target.matches('.advanced-editor')&&state.editor)state.editor.advancedOpen=event.target.open;},true);
+chooser.addEventListener('close',()=>{if(state.editor?.standaloneBatch)state.editor=null;});
 main.addEventListener('toggle',event=>{if(event.target.matches('.global-settings'))state.globalOpen=event.target.open;},true);
 window.addEventListener('beforeunload',event=>{if(state.dirty||state.automationDirty){event.preventDefault();event.returnValue='';}});
 function applyTheme(theme){if(theme==='system')delete document.documentElement.dataset.theme;else document.documentElement.dataset.theme=theme;}

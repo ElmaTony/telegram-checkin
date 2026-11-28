@@ -36,7 +36,7 @@ async def main():
    return await route.fulfill(json={'ok':True,'is_forum':query['chat']==['-201'],'topics':[{'id':'21','title':'讨论区'},{'id':'22','title':'讨论区'},{'id':'23','title':'公告'}] if query['chat']==['-201'] else []})
   raise AssertionError(url.path)
  async with async_playwright() as p:
-  browser=await p.chromium.launch(**({'channel':'msedge'} if sys.platform=='win32' else {}),headless=True)
+  browser=await p.chromium.launch(**({} if Path(p.chromium.executable_path).is_file() else ({'channel':'msedge'} if sys.platform=='win32' else {})),headless=True)
   page=await browser.new_page(viewport={'width':1440,'height':1050})
   page.on('pageerror',lambda e:errors.append(str(e)))
   await page.route('**/api/**',intercept)

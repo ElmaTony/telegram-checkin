@@ -94,7 +94,7 @@ export function parseTimeParts(value){
 function tzItemHtml(id,label,current){
  const selected=String(current||'').trim()===id;
  const offset=tzOffset(id);
- return `<button type="button" class="tz-option${selected?' active':''}" data-action="pick-timezone" data-tz="${esc(id)}" ${selected?'data-selected="true" aria-selected="true"':'aria-selected="false"'}>
+ return `<button type="button" role="option" class="tz-option${selected?' active':''}" data-action="pick-timezone" data-tz="${esc(id)}" ${selected?'data-selected="true" aria-selected="true"':'aria-selected="false"'}>
   <span class="tz-option-main"><span class="tz-option-id">${esc(id)}</span>${label?`<span class="tz-option-label">${esc(label)}</span>`:''}</span>
   <span class="tz-option-meta">${offset?`<span class="tz-offset">${esc(offset)}</span>`:''}${selected?`<span class="tz-check">${icon('check')}</span>`:''}</span>
  </button>`;
@@ -150,11 +150,11 @@ export function timePopoverHtml(value){
   <div class="time-columns">
    <div class="time-col">
     <div class="time-col-head">小时</div>
-    <div class="time-col-list" data-time-col="hour">${HOURS.map(h=>`<button type="button" class="time-cell${hour===h?' active':''}" data-action="pick-hour" data-hour="${h}" ${hour===h?'data-selected="true"':''}>${h}</button>`).join('')}</div>
+    <div class="time-col-list" data-time-col="hour">${HOURS.map(h=>`<button type="button" class="time-cell${hour===h?' active':''}" data-action="pick-hour" data-hour="${h}" tabindex="${hour===h?'0':'-1'}" ${hour===h?'data-selected="true"':''}>${h}</button>`).join('')}</div>
    </div>
    <div class="time-col">
     <div class="time-col-head">分钟</div>
-    <div class="time-col-list" data-time-col="minute">${MINUTES.map(m=>`<button type="button" class="time-cell${minute===m?' active':''}" data-action="pick-minute" data-minute="${m}" ${minute===m?'data-selected="true"':''}>${m}</button>`).join('')}</div>
+    <div class="time-col-list" data-time-col="minute">${MINUTES.map(m=>`<button type="button" class="time-cell${minute===m?' active':''}" data-action="pick-minute" data-minute="${m}" tabindex="${minute===m?'0':'-1'}" ${minute===m?'data-selected="true"':''}>${m}</button>`).join('')}</div>
    </div>
   </div>
   <div class="picker-footer">
@@ -210,16 +210,20 @@ export function automationView(state){
  const s=draft.schedule,n=draft.notifications,busy=state.status?.busy;
  const runtime=state.status?.automation||data,delivery=state.status?.notification||data.notification||{};
  const savedZone=runtime.settings?.timezone||s.timezone;
- return `<div class="page-heading"><div><h1>定时与微信通知</h1><p class="subtitle">设置按天执行的签到计划，整轮结束后合并推送结果。</p></div><div class="actions">${button('reload-automation',state.automationDirty?'放弃修改并载入':'重新载入')}${button('save-automation','保存设置',{primary:true,disabled:busy})}</div></div>
- <div class="automation-grid"><section class="panel"><div class="panel-heading"><div><div class="eyebrow">每日计划</div><h2>每天自动签到</h2></div><label class="check-label"><input type="checkbox" data-schedule="enabled" ${s.enabled?'checked':''}>启用</label></div>
+ const accountsList=state.status?.accounts||[];
+ const canClearKey=Boolean(data.key?.configured&&data.key.source!=='environment');
+ const keyTag=state.automationClearKey?'待清除密钥（保存后生效）':data.key?.configured?'密钥已配置'+(data.key.source==='environment'?' · 环境变量':''):'尚未配置密钥';
+ const keyPlaceholder=state.automationClearKey?'将移除已保存的密钥；或直接输入新密钥覆盖':data.key?.configured?'已配置，留空保留原密钥':'粘贴 SCT 或 sctp 开头的 SendKey';
+ return `<div class="page-heading"><div><h1>定时与微信通知</h1><p class="subtitle">设置按天执行的签到计划，整轮结束后合并推送结果。</p></div><div class="actions"><span class="save-state">${state.automationDirty?'有未保存修改':'设置已保存'}</span>${button('reload-automation',state.automationDirty?'放弃修改并载入':'重新载入')}${button('save-automation','保存设置',{primary:true,disabled:busy})}</div></div>
+ <div class="automation-grid"><section class="panel ${s.enabled?'':'is-disabled-module'}"><div class="panel-heading"><div><div class="eyebrow">每日计划</div><h2>每天自动签到</h2></div><label class="check-label switch-toggle"><input type="checkbox" data-schedule="enabled" ${s.enabled?'checked':''}><span>启用</span></label></div>
  <div class="fields">${timePickerField(s.time,state.openPicker==='time')}${timezonePickerField(s.timezone,state.openPicker==='timezone',state.tzQuery,state.tzShowAll)}
- <fieldset class="account-scope"><legend>定时执行账号</legend><div class="actions"><label class="check-label"><input type="radio" name="schedule-scope" data-schedule-scope="all" ${state.automationScope==='all'?'checked':''}>全部账号</label><label class="check-label"><input type="radio" name="schedule-scope" data-schedule-scope="selected" ${state.automationScope==='selected'?'checked':''}>指定账号</label></div>${state.automationScope==='selected'?`<div class="schedule-accounts">${(state.status?.accounts||[]).map(a=>`<label class="check-label"><input type="checkbox" data-schedule-account="${esc(a.name)}" ${s.accounts.includes(a.name)?'checked':''}>${esc(a.name)}</label>`).join('')}</div>`:''}<p class="small-note">${state.automationScope==='all'?'全部已配置账号，新增账号也会加入计划。':'仅执行勾选账号；至少选择一个。'}</p></fieldset>
+ <fieldset class="account-scope"><legend>定时执行账号</legend><div class="actions"><label class="check-label"><input type="radio" name="schedule-scope" data-schedule-scope="all" ${state.automationScope==='all'?'checked':''}>全部账号</label><label class="check-label"><input type="radio" name="schedule-scope" data-schedule-scope="selected" ${state.automationScope==='selected'?'checked':''}>指定账号</label></div>${state.automationScope==='selected'?`<div class="schedule-accounts">${accountsList.length?accountsList.map(a=>`<label class="check-label"><input type="checkbox" data-schedule-account="${esc(a.name)}" ${s.accounts.includes(a.name)?'checked':''}>${esc(a.name)}</label>`).join(''):'<p class="small-note">还没有配置账号，请先在「账号与规则」中添加。</p>'}</div>`:''}<p class="small-note">${state.automationScope==='all'?'全部已配置账号，新增账号也会加入计划。':'仅执行勾选账号；至少选择一个。'}</p></fieldset>
  <div><label class="check-label"><input type="checkbox" data-schedule="headless" ${s.headless?'checked':''}>定时任务使用后台浏览器</label><label class="check-label"><input type="checkbox" data-schedule="catch_up" ${s.catch_up?'checked':''}>当天错过时间，服务恢复后补跑一次</label></div></div>
  <div class="runtime-card"><div class="eyebrow">已保存的计划</div><p class="automation-next">${runtime.settings?.enabled?esc(formatTime(runtime.next_run,savedZone)||'等待执行'):'定时签到未启用'}</p><p class="small-note automation-last">上次：${esc(labels[runtime.last_run?.status]||'尚无定时执行记录')}${runtime.last_run?.started?' · '+esc(formatTime(runtime.last_run.started,savedZone)):''}</p><p class="small-note automation-service">${esc(runtime.error||runtime.service_error||(!runtime.active?'定时服务未就绪，请检查服务进程':'控制台服务正在管理计划'))}</p></div>
  <p class="footnote">服务需保持运行。当天已发送或发送状态不明的群不会自动重发；进程中断后，同日自动计划也不会再次发起。已运行的当天计划不会因修改时间重跑。</p></section>
- <section class="panel"><div class="panel-heading"><div><div class="eyebrow">SERVER酱</div><h2>微信结果通知</h2></div><label class="check-label"><input type="checkbox" data-notification="enabled" ${n.enabled?'checked':''}>启用</label></div>
- <p class="small-note">整轮汇总成功、待核对、失败和草稿恢复异常。未确认的反馈会如实标记。</p><div class="fields">${field('SendKey',input(state.automationKey||'',`type="password" id="serverchan-key" aria-label="SendKey" autocomplete="new-password" placeholder="${data.key?.configured?'已配置，留空保留原密钥':'粘贴 SCT 或 sctp 开头的 SendKey'}"`),'保存后不回显；环境变量 SERVERCHAN_SENDKEY 优先')}<label class="check-label"><input type="checkbox" data-notification="only_on_issues" ${n.only_on_issues?'checked':''}>仅在待核对、失败或任务异常时推送</label></div>
- <div class="actions section-gap"><span class="tag">${data.key?.configured?'密钥已配置'+(data.key.source==='environment'?' · 环境变量':''):'尚未配置密钥'}</span>${button('test-notification','发送测试通知',{disabled:state.automationDirty||!data.key?.configured||state.testingNotification})}</div><p class="small-note">${esc(data.key?.error||'先保存设置，再用当前已保存结果预览分类样式；测试不触发签到。')}</p>
+ <section class="panel ${n.enabled?'':'is-disabled-module'}"><div class="panel-heading"><div><div class="eyebrow">SERVER酱</div><h2>微信结果通知</h2></div><label class="check-label switch-toggle"><input type="checkbox" data-notification="enabled" ${n.enabled?'checked':''}><span>启用</span></label></div>
+ <p class="small-note">整轮汇总成功、待核对、失败和草稿恢复异常。未确认的反馈会如实标记。</p><div class="fields">${field('SendKey',input(state.automationKey||'',`type="password" id="serverchan-key" aria-label="SendKey" autocomplete="new-password" placeholder="${keyPlaceholder}"`),'保存后不回显；环境变量 SERVERCHAN_SENDKEY 优先')}<label class="check-label"><input type="checkbox" data-notification="only_on_issues" ${n.only_on_issues?'checked':''}>仅在待核对、失败或任务异常时推送</label></div>
+ <div class="actions section-gap"><span class="tag">${keyTag}</span>${canClearKey?(state.automationClearKey?button('undo-clear-sendkey','保留原密钥',{kind:'small',disabled:busy}):button('clear-sendkey','清除密钥',{kind:'small danger',disabled:busy})):''}${button('test-notification','发送测试通知',{disabled:state.automationDirty||!data.key?.configured||state.automationClearKey||state.testingNotification})}</div><p class="small-note">${esc(data.key?.error||'先保存设置，再用当前已保存结果预览分类样式；测试不触发签到。')}</p>
  <div class="runtime-card"><div class="eyebrow">最近推送</div><p class="notification-summary">${esc(delivery.time?`${delivery.ok?'Server酱已接受':'推送未完成'} · ${formatTime(delivery.time,savedZone)}`:'尚未推送')}</p><p class="small-note notification-detail">${esc(delivery.error||delivery.message||'收到微信消息后即可确认接收通道。')}</p></div>
- <p class="footnote"><a href="https://sct.ftqq.com/" target="_blank" rel="noreferrer">打开 Server酱</a> 配置微信通道。推送失败不会影响签到结果，不会自动重试占用额度。</p></section></div><div class="actions"><span class="save-state">${state.automationDirty?'有未保存修改':'设置已保存'}</span></div>`;
+ <p class="footnote"><a href="https://sct.ftqq.com/" target="_blank" rel="noreferrer">打开 Server酱</a> 配置微信通道。推送失败不会影响签到结果，不会自动重试占用额度。</p></section></div>`;
 }

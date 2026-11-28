@@ -129,6 +129,14 @@ class AuditFixUnitTests(unittest.TestCase):
         self.assertFalse(no_retry_res['ok'])
         self.assertEqual(mock_no_retry.call_count, 1)
 
+        # HTTP proxy CONNECT/tunnel timeout falls back to direct once
+        with patch.object(notifications.urllib.request, 'getproxies', return_value={'https': 'http://127.0.0.1:7897'}), \
+             patch.object(notifications.urllib.request, 'urlopen', side_effect=urllib.error.URLError(TimeoutError('timed out'))), \
+             patch.object(notifications.urllib.request, 'build_opener', return_value=fake_opener):
+            proxy_timeout_res = notifications._post(KEY, '标题', '正文')
+        self.assertTrue(proxy_timeout_res['ok'])
+        self.assertEqual(fake_opener.calls, 2)
+
     def test_resolve_proxy_supports_direct_and_authenticated_url(self):
         self.assertIsNone(web_engine.resolve_proxy({'web_proxy': 'direct'}))
         self.assertIsNone(web_engine.resolve_proxy({'web_proxy': 'NONE'}))
@@ -308,6 +316,46 @@ class AuditFixGuiTests(unittest.TestCase):
         self.assertTrue(action['confirmed_by_reply'])
         self.assertEqual(action['sent_mids'], ['1001'])
 
+    def test_config_parse_endpoint_and_history_accounts_list(self):
+        import core.history as history_mod
+        yaml_resp = self.client.post('/api/config/parse', json={'text': 'gui_token: secret\naccounts:\n  - name: Demo\n    groups: []\n'})
+        self.assertEqual(yaml_resp.status_code, 200)
+        self.assertNotIn('gui_token', yaml_resp.json['cfg'])
+        self.assertEqual(yaml_resp.json['cfg']['accounts'][0]['name'], 'Demo')
+
+        json_resp = self.client.post('/api/config/parse', json={'text': '{"accounts":[{"name":"DemoJ","groups":[]}],"gui_token":"secret"}'})
+        self.assertEqual(json_resp.status_code, 200)
+        self.assertNotIn('gui_token', json_resp.json['cfg'])
+        self.assertEqual(json_resp.json['cfg']['accounts'][0]['name'], 'DemoJ')
+
+        self.assertEqual(self.client.post('/api/config/parse', json={'text': '- just a list'}).status_code, 400)
+        self.assertEqual(self.client.post('/api/config/parse', json={'text': '   '}).status_code, 400)
+        self.assertEqual(self.client.post('/api/config/parse', json={'text': 'accounts:\n  - name: Demo\n    groups:\n      - chat: "-101"\n        method: invalid_method\n'}).status_code, 400)
+        self.assertEqual(self.client.post('/api/config/parse', json={'text': 'accounts:\n  - name: Demo\n    groups: []\nschedule:\n  time: 2026-11-28\n'}).status_code, 400)
+
+        log_path = self.root / 'checkin.log'
+        filler = '2026-11-28 00:00:00 [INFO] filler ' + ('x' * 600) + '\n'
+        log_path.write_text(filler * 600 + '2026-11-28 09:00:00 [INFO] tail-marker\n', encoding='utf-8')
+        with patch.object(gui, 'LOG_PATH', log_path):
+            log_resp = self.client.get('/api/logs')
+        self.assertEqual(log_resp.status_code, 200)
+        self.assertIn('tail-marker', log_resp.json['text'])
+        self.assertLessEqual(len(log_resp.json['text'].splitlines()), 500)
+
+        hist_dir = self.root / 'history'
+        hist_dir.mkdir(exist_ok=True)
+        (hist_dir / '2026-11.csv').write_text(
+            '\ufeff时间,账号,群聊,状态,详情\n'
+            '2026-11-27 09:00:00,旧账号,示例群,成功,签到成功\n'
+            '2026-11-27 09:01:00,Audit,Target,失败,超时\n',
+            encoding='utf-8',
+        )
+        with patch.object(gui, 'HISTORY_DIR', hist_dir), patch.object(history_mod, 'HISTORY_DIR', hist_dir):
+            resp = self.client.get('/api/history?account=Audit')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json['total'], 1)
+        self.assertEqual(resp.json['accounts'], ['Audit', '旧账号'])
+
     def test_send_group_actions_retries_once_on_open_timeout_before_sending(self):
         from contextlib import asynccontextmanager
         import core.runner as runner
@@ -459,6 +507,15 @@ class AuditFixGuiTests(unittest.TestCase):
         rechecked = asyncio.run(runner._recheck(eng4, {'chat': '-101', 'message': '签到'}, temp_res, {'reply_wait_seconds': 6}))
         self.assertEqual(eng4.recover_calls, 1)
         self.assertIn('501', rechecked['actions'][0]['sent_mids'])
+
+        # Recovering server mid reconciles stale temporary-ID warning even if reply is still missing
+        warn_res = {'confirm': 'unconfirmed', 'actions': [{'ok': True, 'clicked': False, 'with_image': False, 'error': None, 'confirm': 'unconfirmed', 'sent': True, 'sent_mids': ['100.0001'], 'warning': '仅捕获临时消息 ID，尚未确认服务器接收', 'boundary': {'peer': '-101', 'cutoff': 1.0}}]}
+        reconciled = asyncio.run(runner._recheck(eng4, {'chat': '-101', 'message': '签到'}, warn_res, {'reply_wait_seconds': 6}))
+        self.assertNotIn('warning', reconciled['actions'][0])
+        self.assertNotIn('临时消息 ID', reconciled['result_text'])
+
+        # _STATUS_ACTION_KEYS preserves button_only for frontend hint rendering
+        self.assertIn('button_only', gui._STATUS_ACTION_KEYS)
 
         # /api/status caps unrelated evidence items and truncates long spam text
         long_spam = '广' * 500

@@ -184,6 +184,17 @@ async def _watch_feedback(engine, boundary, group, cfg, *, sent_mids, started_at
         **extra)
 
 
+def _reconcile_action_warning(action):
+    if not action.get('warning'):
+        return
+    has_server_mid = any('.' not in str(m) for m in (action.get('sent_mids') or []))
+    if has_server_mid or action.get('confirmed_by_reply') or action.get('confirm') != 'unconfirmed':
+        if action.get('buttons_complete') is False and not action.get('button_only'):
+            action['warning'] = '必需按钮尚未完成，请核对原消息，不要重新发送口令'
+        else:
+            action.pop('warning', None)
+
+
 def _judge_action(group, cfg, action):
     confirm = judge_replies(group, cfg, action['replies'], action['trusted_replies'])
     return 'unconfirmed' if confirm == 'success' and action.get('buttons_complete') is False else confirm
@@ -361,8 +372,7 @@ async def _execute_group_actions(engine, state, name, group, cfg, lo, hi, today=
                     action['trusted_replies'] = list(engine.last_replied)
                     action['evidence'] = list(engine.last_evidence)
                     action['confirm'] = _judge_action(group, cfg, action)
-                    if action['confirm'] == 'success':
-                        action.pop('warning', None)
+                    _reconcile_action_warning(action)
                 except asyncio.CancelledError:
                     action.update(error='用户取消反馈核对；发送状态待核对', confirm='unconfirmed')
                     actions.append(action)
@@ -431,6 +441,7 @@ async def _recheck(engine, group, result, cfg):
         evidence.update({(item.get('mid'), item.get('t')):item for item in engine.last_evidence})
         action['evidence'] = list(evidence.values())
         action['confirm'] = _judge_action(group, cfg, action)
+        _reconcile_action_warning(action)
         if action.get('ok') and action['confirm'] != 'unconfirmed':
             action['error'] = None
             action.pop('warning', None)

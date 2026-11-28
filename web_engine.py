@@ -1660,7 +1660,7 @@ class WebEngine:
                         c.querySelectorAll('[data-sticker-emoji]').forEach(n=>n.replaceWith(n.dataset.stickerEmoji||''));
                         return (c.textContent||'').replace(/[\u200b-\u200f\uFEFF\uFE0E\uFE0F\uE000-\uF8FF]/g,'').replace(/\s+/g,' ').trim();
                     }).filter(Boolean);
-                    const mentions=[...new Set([...rawBody?.querySelectorAll('[data-follow]')||[]].map(e=>e.getAttribute('data-follow')).filter(id=>/^\d+$/.test(id)))];
+                    const mentions=[...new Set([...rawBody?.querySelectorAll('[data-follow], a.mention[data-peer-id], a[href^="tg://user?id="]')||[]].map(e=>e.getAttribute('data-follow')||e.getAttribute('data-peer-id')||(e.getAttribute('href')||'').replace(/^tg:\/\/user\?id=/,'')).filter(id=>/^\d+$/.test(id)))];
                     const record={mid,t,btns,rm:b.getAttribute('data-reply-to-mid'),ts:Number(b.getAttribute('data-timestamp')||0),
                                   peer:options.peer,mentions,out:b.classList.contains('is-out'),pending:b.classList.contains('is-sending')||mid.includes('.')};
                     capture.records.set(mid,record);
@@ -1728,20 +1728,29 @@ class WebEngine:
             stamps = [r['ts'] for r in data['items'] if r.get('ts')]
             if stamps and min(stamps) < known['cutoff'] - 2 or time.monotonic() >= deadline:
                 break
-            previous = await self.page.evaluate('''peer => [...document.querySelectorAll('.bubbles .bubble[data-mid]')].filter(b=>b.dataset.peerId===peer).map(b=>b.dataset.mid).join(',')''', known['peer'])
-            moved = await self.page.evaluate('''() => {
-                const scroller=[...document.querySelectorAll('.bubbles .bubbles-scrollable')].find(e=>e.checkVisibility());
+            previous = await self.page.evaluate('''peer => {
+                const active = [...document.querySelectorAll('.chat.active')].filter(c => c.checkVisibility());
+                const root = active.find(c => c.querySelector('.peer-title')?.dataset?.peerId === peer) || active[0] || document;
+                return [...root.querySelectorAll('.bubbles .bubble[data-mid]')].filter(b=>b.dataset.peerId===peer).map(b=>b.dataset.mid).join(',');
+            }''', known['peer'])
+            moved = await self.page.evaluate('''peer => {
+                const active = [...document.querySelectorAll('.chat.active')].filter(c => c.checkVisibility());
+                const root = active.find(c => c.querySelector('.peer-title')?.dataset?.peerId === peer) || active[0] || document;
+                const scroller=[...root.querySelectorAll('.bubbles .bubbles-scrollable')].find(e=>e.checkVisibility());
                 if(!scroller)return {ok:false, atTop:true, scrollable:false};
                 const scrollable = scroller.scrollHeight > scroller.clientHeight + 10;
                 const atTop = scroller.scrollTop <= 1;
                 scroller.scrollTop=0;scroller.dispatchEvent(new Event('scroll'));
                 return {ok:true, atTop, scrollable};
-            }''')
+            }''', known['peer'])
             if not moved.get('ok'):
                 break
             try:
-                await self.page.wait_for_function('''({peer,previous}) => [...document.querySelectorAll('.bubbles .bubble[data-mid]')].filter(b=>b.dataset.peerId===peer).map(b=>b.dataset.mid).join(',')!==previous''',
-                    arg={'peer':known['peer'], 'previous':previous}, timeout=max(1,min(700,int((deadline-time.monotonic())*1000))))
+                await self.page.wait_for_function('''({peer,previous}) => {
+                    const active = [...document.querySelectorAll('.chat.active')].filter(c => c.checkVisibility());
+                    const root = active.find(c => c.querySelector('.peer-title')?.dataset?.peerId === peer) || active[0] || document;
+                    return [...root.querySelectorAll('.bubbles .bubble[data-mid]')].filter(b=>b.dataset.peerId===peer).map(b=>b.dataset.mid).join(',')!==previous;
+                }''', arg={'peer':known['peer'], 'previous':previous}, timeout=max(1,min(700,int((deadline-time.monotonic())*1000))))
                 stalled = 0
             except Exception:
                 if self.page.is_closed():

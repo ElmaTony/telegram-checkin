@@ -41,7 +41,7 @@ async def main():
   if data is None:raise AssertionError(path)
   await route.fulfill(json=data)
  async with async_playwright() as p:
-  browser=await p.chromium.launch(**({'channel':'msedge'} if sys.platform=='win32' else {}),headless=True)
+  browser=await p.chromium.launch(**({} if Path(p.chromium.executable_path).is_file() else ({'channel':'msedge'} if sys.platform=='win32' else {})),headless=True)
   page=await browser.new_page(viewport={'width':1440,'height':1080})
   page.on('pageerror',lambda error:errors.append(str(error)))
   await page.route('**/api/**',intercept)
